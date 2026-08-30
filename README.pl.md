@@ -17,7 +17,7 @@ Wstrzymywanie Arq zawsze, gdy aplikacja GeForce NOW jest otwarta, byłoby zbyt s
 3. **Bezpiecznie podtrzymuje pauzę** — ustawia dziesięciominutową pauzę i odnawia ją co cztery minuty podczas streamingu.
 4. **Wznawia backup po wyjściu z gry** — wywołuje `arqc resumeBackups` w ciągu kilku sekund, nawet jeśli launcher GeForce NOW nadal jest otwarty.
 5. **Działa bezpiecznie przy błędach** — problem z odczytem procesu nie może fałszywie wznowić Arq; pominięte zdarzenie jest uzgadniane w ciągu 60 sekund; po wyłączeniu guarda pozostaje tylko automatycznie wygasająca pauza.
-6. **Kontroluje własny stan** — wznawia wyłącznie pauzę zapisaną przez guard, a nie niezależną pauzę użytkownika.
+6. **Śledzi własne udane pauzy** — wznawia backup tylko wtedy, gdy prywatny stan potwierdza, że guard skutecznie wywołał pauzę. Arq udostępnia jedną globalną pauzę, dlatego łączenie sesji GFN z niezależną ręczną pauzą Arq nie jest obsługiwane i może zakończyć się jej zastąpieniem albo wznowieniem.
 7. **Działa cicho i lokalnie** — bez roota, bez połączeń sieciowych, z użyciem około 2 MB RAM i praktycznie 0% CPU w spoczynku na referencyjnym Macu Intel.
 8. **Udostępnia opcjonalne powiadomienia macOS** — domyślnie wyłączone, automatycznie po polsku lub angielsku i bez powtarzania komunikatu przy odnawianiu pauzy.
 
@@ -46,6 +46,10 @@ Wcześniejszy wariant `WatchPaths` wyglądał lepiej na papierze, ale macOS scal
 **Dlaczego pauza trwa 10 minut i jest odnawiana co 4 minuty?**
 
 Zapas chroni przed chwilowymi opóźnieniami procesu. Jeśli guard się zamknie albo zostanie wyładowany, Arq automatycznie ruszy po wygaśnięciu ostatniej pauzy.
+
+**Co z osobną ręczną pauzą Arq?**
+
+CLI Arq udostępnia jedną globalną pauzę i nie pozwala odczytać poprzedniego stanu. Nie łącz niezależnej ręcznej pauzy Arq z sesją GeForce NOW: pauza guarda może ją zastąpić, a automatyczne wznowienie — zakończyć. Ograniczenie nie wpływa na zwykłe sesje kontrolowane przez guard.
 
 ## Instalacja
 

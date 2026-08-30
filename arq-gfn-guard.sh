@@ -259,6 +259,10 @@ reconcile_backup_state() {
       fi
     fi
   elif [[ -f "$STATE_FILE" ]]; then
+    # Arq exposes one global pause and no supported CLI readback for the pause
+    # that existed before this guard acted. The state file proves that this
+    # guard successfully issued a pause, but overlapping independent manual
+    # pauses are intentionally documented as unsupported.
     if run_arqc resumeBackups; then
       rm -f "$STATE_FILE"
       log_message "GFN stream inactive; Arq resumed"

@@ -124,6 +124,22 @@ done
   print -u2 -- "Polish README must document silent-by-default behavior"
   exit 1
 }
+if /usr/bin/grep -Fq -- 'not an unrelated user pause' "$SCRIPT_DIR/README.md"; then
+  print -u2 -- "English README must not claim that global manual Arq pauses are preserved"
+  exit 1
+fi
+if /usr/bin/grep -Fq -- 'a nie niezależną pauzę użytkownika' "$SCRIPT_DIR/README.pl.md"; then
+  print -u2 -- "Polish README must not claim that global manual Arq pauses are preserved"
+  exit 1
+fi
+/usr/bin/grep -Fq -- 'overlapping an independent manual Arq pause is unsupported' "$SCRIPT_DIR/README.md" || {
+  print -u2 -- "English README must document the global-pause limitation"
+  exit 1
+}
+/usr/bin/grep -Fq -- 'łączenie sesji GFN z niezależną ręczną pauzą Arq nie jest obsługiwane' "$SCRIPT_DIR/README.pl.md" || {
+  print -u2 -- "Polish README must document the global-pause limitation"
+  exit 1
+}
 
 # Notifications are opt-in. When enabled, their language can be forced to EN
 # or PL; messages are passed to AppleScript as argv, never interpolated code.
