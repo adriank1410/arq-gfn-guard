@@ -2,31 +2,54 @@
 
 [English](README.md) | Polski
 
-Lekki LaunchAgent dla macOS, który wstrzymuje [Arq 7](https://www.arqbackup.com/) wyłącznie podczas prawdziwej sesji streamingu w [GeForce NOW](https://www.nvidia.com/geforce-now/).
+Wstrzymuje backupy [Arq 7](https://www.arqbackup.com/) podczas prawdziwej sesji streamingu w [GeForce NOW](https://www.nvidia.com/geforce-now/), a po jej zakończeniu automatycznie je wznawia.
 
-## Po co
+## Problem
 
-Cloud gaming jest wrażliwy na zapchany upload i wzrost opóźnień. Backup działający w tle może powodować przycięcia lub utratę pakietów. Samo sprawdzanie, czy aplikacja GeForce NOW jest otwarta, byłoby zbyt szerokie — launcher często zostaje uruchomiony przez cały dzień.
+Cloud gaming jest wrażliwy na zapchany upload i wzrost opóźnień. Backup działający w tle może zamienić stabilną sesję GeForce NOW w przycięcia albo utratę pakietów.
 
-## Jak to działa
+Wstrzymywanie Arq zawsze, gdy aplikacja GeForce NOW jest otwarta, byłoby zbyt szerokie — launcher może działać przez cały dzień. Istotne jest to, czy rzeczywiście trwa streaming.
 
-- Obserwuje lokalny log niezawodności NVIDIA i reaguje na faktyczny cykl sesji streamingu.
-- Wstrzymuje wszystkie plany Arq już podczas przygotowania sesji, przed uruchomieniem streamu.
-- Ustawia dziesięciominutową pauzę Arq i odnawia ją co cztery minuty podczas gry.
-- Wznawia Arq kilka sekund po wyjściu z trybu streamingu, nawet jeśli aplikacja GeForce NOW nadal jest otwarta.
-- Co 60 sekund wykonuje kontrolne uzgodnienie stanu na wypadek pominięcia zdarzenia w logu.
-- Działa jako bieżący użytkownik, bez `sudo` i bez połączeń sieciowych. Na referencyjnym Macu Intel zajmuje około 2 MB RAM i praktycznie 0% CPU w spoczynku.
-- Domyślnie działa **bez powiadomień**. Opcjonalne komunikaty są dostępne po polsku i angielsku.
+## Co robi
 
-Guard wznawia wyłącznie pauzę, którą sam utworzył. Jeśli zostanie zamknięty lub wyładowany, dziesięciominutowa pauza Arq wygaśnie automatycznie.
+1. **Wykrywa prawdziwe sesje streamingu** — obserwuje lokalny log niezawodności NVIDIA pod kątem przygotowania, startu, zakończenia i wyjścia z trybu streamingu.
+2. **Wstrzymuje backup przed startem streamu** — wywołuje oficjalne polecenie Arq `arqc pauseBackups` już po wykryciu przygotowania sesji.
+3. **Bezpiecznie podtrzymuje pauzę** — ustawia dziesięciominutową pauzę i odnawia ją co cztery minuty podczas streamingu.
+4. **Wznawia backup po wyjściu z gry** — wywołuje `arqc resumeBackups` w ciągu kilku sekund, nawet jeśli launcher GeForce NOW nadal jest otwarty.
+5. **Działa bezpiecznie przy błędach** — problem z odczytem procesu nie może fałszywie wznowić Arq; pominięte zdarzenie jest uzgadniane w ciągu 60 sekund; po wyłączeniu guarda pozostaje tylko automatycznie wygasająca pauza.
+6. **Kontroluje własny stan** — wznawia wyłącznie pauzę zapisaną przez guard, a nie niezależną pauzę użytkownika.
+7. **Działa cicho i lokalnie** — bez roota, bez połączeń sieciowych, z użyciem około 2 MB RAM i praktycznie 0% CPU w spoczynku na referencyjnym Macu Intel.
+8. **Udostępnia opcjonalne powiadomienia macOS** — domyślnie wyłączone, automatycznie po polsku lub angielsku i bez powtarzania komunikatu przy odnawianiu pauzy.
+
+### Powiadomienia
+
+| Zdarzenie | Polski | English |
+|---|---|---|
+| Początek streamu | Backup wstrzymany na czas aktywnej sesji GeForce NOW. | Backup paused for the active GeForce NOW session. |
+| Koniec streamu | Sesja GeForce NOW zakończona; backup wznowiony. | GeForce NOW session ended; backup resumed. |
+| Odnowienie pauzy | *(bez powiadomienia)* | *(silent)* |
+
+Powiadomienia można włączyć przy instalacji przez `ARQ_GFN_NOTIFICATIONS=1`. Ich język jest zgodny z macOS; `ARQ_GFN_LANG=pl` albo `ARQ_GFN_LANG=en` wymusza konkretny wariant.
+
+## Decyzje projektowe
+
+**Dlaczego log GFN zamiast sprawdzania, czy aplikacja jest otwarta?**
+
+Log pokazuje faktyczny cykl streamingu. Launcher może dzięki temu pozostać otwarty bez ciągłego blokowania Arq.
+
+**Dlaczego stałe sprawdzanie co dwie sekundy zamiast `launchd` `WatchPaths`?**
+
+Wcześniejszy wariant `WatchPaths` wyglądał lepiej na papierze, ale macOS scalał lub opóźniał zdarzenia na tyle, że zarówno pauza, jak i wznowienie następowały zbyt późno. Obecna szybka ścieżka spoczynkowa nie analizuje logu ani nie wywołuje `pgrep`: wykonuje wyłącznie działające wewnątrz procesu sprawdzenie sygnatury przez `zsh/stat`, a następnie zasypia przez `zselect`. `tail`, `awk`, sprawdzenie procesu i odczyt zegara uruchamiają się dopiero po zmianie logu albo podczas kontrolnego uzgodnienia co 60 sekund.
+
+`fswatch` wymagałby Homebrew. Natywny helper Swift/kqueue usunąłby timer, ale oznaczałby dystrybucję i utrzymywanie pliku binarnego o większym zużyciu pamięci. Interwał dwóch sekund pozostaje konfigurowalny.
+
+**Dlaczego pauza trwa 10 minut i jest odnawiana co 4 minuty?**
+
+Zapas chroni przed chwilowymi opóźnieniami procesu. Jeśli guard się zamknie albo zostanie wyładowany, Arq automatycznie ruszy po wygaśnięciu ostatniej pauzy.
 
 ## Instalacja
 
-Wymagania:
-
-- macOS z Arq 7 w `/Applications/Arq.app`
-- GeForce NOW w `/Applications/GeForceNOW.app`
-- wyłączone hasło aplikacji Arq, aby LaunchAgent użytkownika mógł bezobsługowo wywoływać `arqc`; nie wyłącza to szyfrowania backupu
+Nie używaj `sudo` — to LaunchAgent bieżącego użytkownika.
 
 ```bash
 git clone https://github.com/adriank1410/arq-gfn-guard.git
@@ -34,48 +57,28 @@ cd arq-gfn-guard
 ./install.sh
 ```
 
-Domyślna instalacja działa po cichu. Aby włączyć powiadomienia:
+Domyślnie działa **bez powiadomień**. Można je włączyć przez:
 
 ```bash
 ARQ_GFN_NOTIFICATIONS=1 ./install.sh
 ```
 
-Język powiadomień jest automatycznie zgodny z macOS. Można go wymusić:
+W razie potrzeby można wymusić język:
 
 ```bash
 ARQ_GFN_NOTIFICATIONS=1 ARQ_GFN_LANG=pl ./install.sh
 ARQ_GFN_NOTIFICATIONS=1 ARQ_GFN_LANG=en ./install.sh
 ```
 
-Ponowne uruchomienie instalatora bez nadpisania zachowuje aktualne ustawienia powiadomień.
+Ponowne uruchomienie `./install.sh` bez nadpisania zachowuje zainstalowane ustawienia.
 
-## Powiadomienia
+## Odinstalowanie
 
-| Zdarzenie | Polski | English |
-|---|---|---|
-| Początek streamu | Backup wstrzymany na czas aktywnej sesji GeForce NOW. | Backup paused for the active GeForce NOW session. |
-| Koniec streamu | Sesja GeForce NOW zakończona; backup wznowiony. | GeForce NOW session ended; backup resumed. |
+```bash
+./uninstall.sh
+```
 
-Aby wrócić do trybu cichego, uruchom `ARQ_GFN_NOTIFICATIONS=0 ./install.sh`.
-
-## Konfiguracja
-
-Instalator zapisuje poniższe zmienne w wygenerowanym pliku LaunchAgenta:
-
-| Zmienna | Domyślnie | Znaczenie |
-|---|---:|---|
-| `ARQ_GFN_NOTIFICATIONS` | `0` | `1` włącza komunikaty początku i końca sesji; `0` oznacza tryb cichy |
-| `ARQ_GFN_LANG` | puste | `en`, `pl` albo puste dla autodetekcji języka macOS |
-| `ARQ_GFN_LOOP_SECONDS` | `2` | Interwał lekkiego sprawdzania sygnatury logu |
-| `ARQ_GFN_SAFETY_SECONDS` | `60` | Interwał pełnego kontrolnego uzgodnienia stanu |
-
-Pauza celowo trwa 10 minut i jest odnawiana co cztery minuty. Zapewnia to zapas przy chwilowym opóźnieniu procesu, a jednocześnie automatyczne wznowienie, jeśli agent zniknie.
-
-## Dlaczego sprawdzanie co dwie sekundy
-
-Guard nie analizuje logu NVIDIA ani nie wywołuje `pgrep` co dwie sekundy. Szybka ścieżka spoczynkowa składa się wyłącznie z działającego wewnątrz procesu sprawdzenia sygnatury pliku przez `zsh/stat` i uśpienia `zselect`. `tail`, `awk`, sprawdzenie procesu i odczyt zegara uruchamiają się dopiero po zmianie logu albo podczas kontrolnego uzgodnienia co 60 sekund.
-
-Wcześniejszy wariant oparty na `launchd` `WatchPaths` wyglądał lepiej na papierze, ale macOS scalał lub opóźniał zdarzenia na tyle, że zarówno pauza, jak i wznowienie potrafiły następować zbyt późno. `fswatch` dodałby zależność od Homebrew, a natywny helper Swift/kqueue wymagałby dystrybucji i utrzymywania pliku binarnego o większym zużyciu pamięci. Obecne rozwiązanie zajmowało na referencyjnym Macu Intel około 2 MB RAM i praktycznie 0% CPU w spoczynku. Interwał pozostaje konfigurowalny dla osób, które wolą wolniejszą reakcję.
+Logi pozostają w `~/Library/Logs/ArqGFNGuard/`. Jeśli guard utworzył aktywną pauzę, wygaśnie ona automatycznie w ciągu 10 minut.
 
 ## Obsługa
 
@@ -90,17 +93,36 @@ launchctl print gui/$UID/com.local.arq-gfn-guard
 ./install.sh
 ```
 
-## Odinstalowanie
+## Konfiguracja
+
+Przekaż nadpisanie do `./install.sh`; instalator je sprawdzi i zapisze w wygenerowanym pliku LaunchAgenta. Ponowna instalacja bez nadpisania zachowuje istniejące wartości.
+
+| Zmienna | Domyślnie | Znaczenie |
+|---|---:|---|
+| `ARQ_GFN_NOTIFICATIONS` | `0` | `1` włącza jeden komunikat początku i końca sesji; `0` oznacza tryb cichy |
+| `ARQ_GFN_LANG` | puste | `en`, `pl` albo puste dla autodetekcji języka macOS |
+| `ARQ_GFN_LOOP_SECONDS` | `2` | Interwał lekkiego sprawdzania sygnatury logu |
+| `ARQ_GFN_SAFETY_SECONDS` | `60` | Interwał pełnego kontrolnego uzgodnienia stanu |
+
+Przykład z wolniejszą, pięciosekundową reakcją:
 
 ```bash
-./uninstall.sh
+ARQ_GFN_LOOP_SECONDS=5 ./install.sh
 ```
 
-Logi celowo pozostają na dysku. Jeśli guard utworzył aktywną pauzę, wygaśnie ona w ciągu 10 minut.
+## Pliki
+
+| Plik w repo | Miejsce instalacji |
+|---|---|
+| `arq-gfn-guard.sh` | `~/Library/Application Support/ArqGFNGuard/arq-gfn-guard.sh` |
+| `com.local.arq-gfn-guard.plist` | `~/Library/LaunchAgents/com.local.arq-gfn-guard.plist` *(generowany przez instalator)* |
+| *(tworzony podczas działania)* | `~/Library/Application Support/ArqGFNGuard/guard-paused` |
+| *(tworzony podczas działania)* | `~/Library/Logs/ArqGFNGuard/guard.log` |
+| *(wyjście launchd)* | `~/Library/Logs/ArqGFNGuard/launchd.out.log` oraz `launchd.err.log` |
 
 ## Testy
 
-Testy korzystają z odizolowanych logów i stanu oraz atrap `arqc` i powiadomień. Nigdy nie wstrzymują prawdziwej instalacji Arq.
+Testy używają odizolowanych logów i stanu oraz atrap `arqc`, zegara, odczytu procesu i powiadomień. Nigdy nie wstrzymują prawdziwej instalacji Arq.
 
 ```bash
 zsh -n arq-gfn-guard.sh install.sh uninstall.sh tests/test_guard.zsh
@@ -108,14 +130,19 @@ zsh tests/test_guard.zsh
 plutil -lint com.local.arq-gfn-guard.plist
 ```
 
+## Wymagania
+
+- macOS z Arq 7 w `/Applications/Arq.app`
+- GeForce NOW w `/Applications/GeForceNOW.app`
+- wyłączone hasło aplikacji Arq, aby LaunchAgent użytkownika mógł bezobsługowo wywoływać `arqc`; **nie** wyłącza to szyfrowania backupu
+
 ## Bezpieczeństwo i prywatność
 
-- Bez uprawnień roota i bez połączeń sieciowych.
 - Stały systemowy `PATH` i absolutne ścieżki poleceń istotnych dla bezpieczeństwa.
 - Prywatny stan i logi: katalogi `700`, pliki `600`.
-- Atomowy zapis stanu oraz ograniczony odczyt logu.
+- Atomowy zapis stanu, ograniczony odczyt jednego megabajta logu i automatyczna rotacja.
 - Tekst powiadomienia trafia do AppleScript jako argument, a nie fragment kodu.
-- Analizowany jest wyłącznie końcowy 1 MB lokalnego logu NVIDIA; tytuły gier i dane konta nie są nigdzie wysyłane.
+- Tytuły gier, dane konta, treść logu ani telemetria nie są nigdzie wysyłane.
 
 ## Licencja
 
