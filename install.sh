@@ -28,6 +28,18 @@ else
   notification_language="$(/usr/bin/plutil -extract EnvironmentVariables.ARQ_GFN_LANG raw -o - "$DEST_PLIST" 2>/dev/null)" \
     || notification_language=""
 fi
+if (( ${+ARQ_GFN_LOOP_SECONDS} )); then
+  loop_seconds="$ARQ_GFN_LOOP_SECONDS"
+else
+  loop_seconds="$(/usr/bin/plutil -extract EnvironmentVariables.ARQ_GFN_LOOP_SECONDS raw -o - "$DEST_PLIST" 2>/dev/null)" \
+    || loop_seconds="2"
+fi
+if (( ${+ARQ_GFN_SAFETY_SECONDS} )); then
+  safety_seconds="$ARQ_GFN_SAFETY_SECONDS"
+else
+  safety_seconds="$(/usr/bin/plutil -extract EnvironmentVariables.ARQ_GFN_SAFETY_SECONDS raw -o - "$DEST_PLIST" 2>/dev/null)" \
+    || safety_seconds="60"
+fi
 
 install_language="${ARQ_GFN_INSTALL_LANG:-$notification_language}"
 if [[ -z "$install_language" ]]; then
@@ -60,6 +72,12 @@ if [[ -n "$notification_language" \
       "ARQ_GFN_LANG musi mieć wartość en, pl albo być puste dla autodetekcji."
   exit 2
 fi
+if [[ ! "$loop_seconds" =~ ^[1-9][0-9]*$ \
+    || ! "$safety_seconds" =~ ^[1-9][0-9]*$ ]]; then
+  msg "ARQ_GFN_LOOP_SECONDS and ARQ_GFN_SAFETY_SECONDS must be positive integers." \
+      "ARQ_GFN_LOOP_SECONDS i ARQ_GFN_SAFETY_SECONDS muszą być dodatnimi liczbami całkowitymi."
+  exit 2
+fi
 if [[ ! -x "$SOURCE_SCRIPT" || ! -f "$SOURCE_PLIST" ]]; then
   msg "Installer files are incomplete." "Brakuje plików instalatora."
   exit 1
@@ -87,6 +105,8 @@ fi
 /usr/bin/plutil -replace StandardErrorPath -string "$STDERR_LOG" "$DEST_PLIST"
 /usr/bin/plutil -replace EnvironmentVariables.ARQ_GFN_NOTIFICATIONS -string "$notifications_value" "$DEST_PLIST"
 /usr/bin/plutil -replace EnvironmentVariables.ARQ_GFN_LANG -string "$notification_language" "$DEST_PLIST"
+/usr/bin/plutil -replace EnvironmentVariables.ARQ_GFN_LOOP_SECONDS -string "$loop_seconds" "$DEST_PLIST"
+/usr/bin/plutil -replace EnvironmentVariables.ARQ_GFN_SAFETY_SECONDS -string "$safety_seconds" "$DEST_PLIST"
 /bin/chmod 644 "$DEST_PLIST"
 /usr/bin/plutil -lint "$DEST_PLIST" >/dev/null
 

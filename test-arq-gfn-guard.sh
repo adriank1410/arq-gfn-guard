@@ -88,6 +88,14 @@ fi
   print -u2 -- "Notifications must be disabled by default in the LaunchAgent"
   exit 1
 }
+[[ "$(/usr/bin/plutil -extract EnvironmentVariables.ARQ_GFN_LOOP_SECONDS raw -o - "$GUARD_PLIST")" == "2" ]] || {
+  print -u2 -- "LaunchAgent must expose the two-second loop default"
+  exit 1
+}
+[[ "$(/usr/bin/plutil -extract EnvironmentVariables.ARQ_GFN_SAFETY_SECONDS raw -o - "$GUARD_PLIST")" == "60" ]] || {
+  print -u2 -- "LaunchAgent must expose the 60-second safety default"
+  exit 1
+}
 
 rendered_plist="$TEST_ROOT/rendered.plist"
 /bin/cp "$GUARD_PLIST" "$rendered_plist"

@@ -22,6 +22,10 @@
     <string>0</string>
     <key>ARQ_GFN_LANG</key>
     <string></string>
+    <key>ARQ_GFN_LOOP_SECONDS</key>
+    <string>2</string>
+    <key>ARQ_GFN_SAFETY_SECONDS</key>
+    <string>60</string>
   </dict>
   <key>StandardOutPath</key>
   <string>__ARQ_GFN_STDOUT__</string>
