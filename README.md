@@ -71,6 +71,12 @@ The installer stores these variables in the generated LaunchAgent plist:
 
 The pause lease is intentionally 10 minutes and is renewed every 4 minutes. This provides enough overlap for temporary scheduling delays while guaranteeing automatic recovery if the agent disappears.
 
+## Why a two-second check
+
+The guard does not parse the NVIDIA log or call `pgrep` every two seconds. Its idle fast path consists only of the in-process `zsh/stat` file signature check followed by `zselect` sleep. `tail`, `awk`, the process check, and the wall-clock read run only when the log changes or during the 60-second safety reconciliation.
+
+An earlier `launchd` `WatchPaths` design was more elegant on paper, but macOS coalesced or delayed events enough to postpone both pause and resume. `fswatch` would add a Homebrew dependency, while a native Swift/kqueue helper would require shipping and maintaining a compiled binary with higher resident memory. The current implementation measured around 2 MB RAM and effectively 0% idle CPU on the reference Intel Mac. The interval remains configurable for users who prefer a slower response.
+
 ## Usage
 
 ```bash
@@ -97,8 +103,8 @@ Logs are intentionally retained. If the guard owned an active pause, that lease 
 The test suite uses isolated temporary logs, state, a fake `arqc`, and a fake notification boundary. It never pauses the real Arq installation.
 
 ```bash
-zsh -n arq-gfn-guard.sh install.sh uninstall.sh test-arq-gfn-guard.sh
-zsh test-arq-gfn-guard.sh
+zsh -n arq-gfn-guard.sh install.sh uninstall.sh tests/test_guard.zsh
+zsh tests/test_guard.zsh
 plutil -lint com.local.arq-gfn-guard.plist
 ```
 

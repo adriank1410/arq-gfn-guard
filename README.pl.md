@@ -71,6 +71,12 @@ Instalator zapisuje poniższe zmienne w wygenerowanym pliku LaunchAgenta:
 
 Pauza celowo trwa 10 minut i jest odnawiana co cztery minuty. Zapewnia to zapas przy chwilowym opóźnieniu procesu, a jednocześnie automatyczne wznowienie, jeśli agent zniknie.
 
+## Dlaczego sprawdzanie co dwie sekundy
+
+Guard nie analizuje logu NVIDIA ani nie wywołuje `pgrep` co dwie sekundy. Szybka ścieżka spoczynkowa składa się wyłącznie z działającego wewnątrz procesu sprawdzenia sygnatury pliku przez `zsh/stat` i uśpienia `zselect`. `tail`, `awk`, sprawdzenie procesu i odczyt zegara uruchamiają się dopiero po zmianie logu albo podczas kontrolnego uzgodnienia co 60 sekund.
+
+Wcześniejszy wariant oparty na `launchd` `WatchPaths` wyglądał lepiej na papierze, ale macOS scalał lub opóźniał zdarzenia na tyle, że zarówno pauza, jak i wznowienie potrafiły następować zbyt późno. `fswatch` dodałby zależność od Homebrew, a natywny helper Swift/kqueue wymagałby dystrybucji i utrzymywania pliku binarnego o większym zużyciu pamięci. Obecne rozwiązanie zajmowało na referencyjnym Macu Intel około 2 MB RAM i praktycznie 0% CPU w spoczynku. Interwał pozostaje konfigurowalny dla osób, które wolą wolniejszą reakcję.
+
 ## Obsługa
 
 ```bash
@@ -97,8 +103,8 @@ Logi celowo pozostają na dysku. Jeśli guard utworzył aktywną pauzę, wygaśn
 Testy korzystają z odizolowanych logów i stanu oraz atrap `arqc` i powiadomień. Nigdy nie wstrzymują prawdziwej instalacji Arq.
 
 ```bash
-zsh -n arq-gfn-guard.sh install.sh uninstall.sh test-arq-gfn-guard.sh
-zsh test-arq-gfn-guard.sh
+zsh -n arq-gfn-guard.sh install.sh uninstall.sh tests/test_guard.zsh
+zsh tests/test_guard.zsh
 plutil -lint com.local.arq-gfn-guard.plist
 ```
 

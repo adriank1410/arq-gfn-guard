@@ -3,7 +3,8 @@
 set -eu
 unsetopt bg_nice
 
-readonly SCRIPT_DIR="${0:A:h}"
+readonly TEST_DIR="${0:A:h}"
+readonly SCRIPT_DIR="${TEST_DIR:h}"
 readonly GUARD_SCRIPT="$SCRIPT_DIR/arq-gfn-guard.sh"
 readonly GUARD_PLIST="$SCRIPT_DIR/com.local.arq-gfn-guard.plist"
 readonly INSTALL_SCRIPT="$SCRIPT_DIR/install.sh"
