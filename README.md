@@ -17,7 +17,7 @@ Pausing Arq whenever the GeForce NOW app is open is too broad because its launch
 3. **Keeps the pause alive safely** — uses a 10-minute lease renewed every 4 minutes while streaming remains active.
 4. **Resumes after the game exits** — calls `arqc resumeBackups` within a few seconds, even when the GeForce NOW launcher stays open.
 5. **Fails safe** — a process-query error cannot falsely resume Arq; a missed event is reconciled within 60 seconds; an unloaded guard leaves only a pause that expires automatically.
-6. **Owns its state** — resumes only a pause recorded by the guard, not an unrelated user pause.
+6. **Tracks successful guard pauses** — resumes only when its private state confirms that the guard successfully issued a pause. Arq exposes one global pause, so overlapping an independent manual Arq pause is unsupported and may be replaced or resumed by the guard.
 7. **Runs quietly and locally** — no root privileges, no network requests, about 2 MB RAM, and effectively 0% idle CPU on the reference Intel Mac.
 8. **Offers optional macOS notifications** — off by default, with automatic English/Polish localization and no repeated message during lease renewals.
 
@@ -46,6 +46,10 @@ An earlier `WatchPaths` version was more elegant on paper, but macOS coalesced o
 **Why a 10-minute lease renewed every 4 minutes?**
 
 The overlap tolerates temporary scheduling delays. If the guard crashes or is unloaded, Arq resumes automatically when the final lease expires.
+
+**What about a separate manual Arq pause?**
+
+Arq's CLI exposes one global pause and does not expose the previous pause state. Do not overlap an independent manual Arq pause with a GeForce NOW session: the guard's lease may replace it, and the automatic resume may end it. This limitation does not affect normal guard-controlled sessions.
 
 ## Install
 
