@@ -144,9 +144,10 @@ log_signature() {
       log_signature_out="unreadable"
       return 0
     }
-    log_signature_out="${file_stat[mtime]}:${file_stat[size]}"
+    # Rotation may preserve both size and mtime; include the file identity.
+    log_signature_out="${file_stat[device]}:${file_stat[inode]}:${file_stat[mtime]}:${file_stat[size]}"
   else
-    log_signature_out="$(/usr/bin/stat -f '%m:%z' "$GFN_LOG_FILE" 2>/dev/null)" \
+    log_signature_out="$(/usr/bin/stat -f '%d:%i:%m:%z' "$GFN_LOG_FILE" 2>/dev/null)" \
       || log_signature_out="unreadable"
   fi
 }
