@@ -134,6 +134,25 @@ zsh tests/test_guard.zsh
 plutil -lint com.local.arq-gfn-guard.plist
 ```
 
+## Lokalna próba bez Arq
+
+Uruchom w `zsh` z katalogu repo. Przykład symuluje start sesji na plikach tymczasowych, wyświetla decyzję i usuwa pliki próby. Nie instaluje LaunchAgenta ani nie wywołuje Arq. Oczekiwany wpis: `DRY-RUN arqc pauseBackups 10`. Pełny cykl pause/renew/resume sprawdza zestaw testów powyżej.
+
+```zsh
+(
+  test_root=$(mktemp -d /tmp/arq-gfn-preview.XXXXXX) || exit 1
+  trap 'rm -rf "$test_root"' EXIT
+  printf '%s\n' IPC_STREAMING_STARTED_EVENT > "$test_root/gfn.log"
+  ARQ_GFN_GUARD_DRY_RUN=1 ARQ_GFN_GUARD_ONCE=1 \
+    ARQ_GFN_FORCE_PROCESS=1 ARQ_GFN_NOTIFICATIONS=0 \
+    ARQ_GFN_LOG_FILE="$test_root/gfn.log" \
+    ARQ_GFN_STATE_DIR="$test_root/state" \
+    ARQ_GFN_GUARD_LOG="$test_root/guard.log" \
+    ./arq-gfn-guard.sh
+  cat "$test_root/guard.log"
+)
+```
+
 ## Wymagania
 
 - macOS z Arq 7 w `/Applications/Arq.app`

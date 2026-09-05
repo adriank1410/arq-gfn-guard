@@ -39,8 +39,8 @@ start_monitor() {
   ARQ_GFN_STATE_DIR="$TEST_ROOT/state" \
   ARQ_GFN_GUARD_LOG="$TEST_ROOT/guard.log" \
   ARQ_GFN_LOOP_SECONDS=1 \
-  ARQ_GFN_SAFETY_SECONDS=2 \
-  "$GUARD_SCRIPT" &
+  ARQ_GFN_SAFETY_SECONDS="${1:-2}" \
+  "${2:-$GUARD_SCRIPT}" &
   monitor_pid=$!
 }
 
@@ -500,5 +500,55 @@ wait_for_log "GFN stream inactive; Arq resumed"
 kill "$monitor_pid"
 wait "$monitor_pid" 2>/dev/null || true
 monitor_pid=""
+
+# Rotation can replace a log with the same size and mtime. Both stat paths
+# must notice the new file before the safety reconciliation becomes due.
+fallback_guard="$TEST_ROOT/fallback-guard.zsh"
+/usr/bin/sed 's@zmodload zsh/stat@zmodload zsh/arq_gfn_missing_stat@' \
+  "$GUARD_SCRIPT" > "$fallback_guard"
+chmod +x "$fallback_guard"
+for rotation_guard in "$GUARD_SCRIPT" "$fallback_guard"; do
+  : > "$TEST_ROOT/guard.log"
+  printf '%-80s\n' 'IPC_STREAMING_MODE_EXIT_EVENT' > "$TEST_ROOT/gfn.log"
+  start_monitor 100 "$rotation_guard"
+  /bin/sleep 1.2
+  for marker in IPC_STREAMING_STARTED_EVENT IPC_STREAMING_MODE_EXIT_EVENT; do
+    printf '%-80s\n' "$marker" > "$TEST_ROOT/replacement.log"
+    /usr/bin/touch -r "$TEST_ROOT/gfn.log" "$TEST_ROOT/replacement.log"
+    [[ "$(/usr/bin/stat -f '%m:%z' "$TEST_ROOT/gfn.log")" == \
+       "$(/usr/bin/stat -f '%m:%z' "$TEST_ROOT/replacement.log")" ]] || {
+      print -u2 -- "Rotation fixture must preserve size and mtime"
+      exit 1
+    }
+    mv -f "$TEST_ROOT/replacement.log" "$TEST_ROOT/gfn.log"
+    if [[ "$marker" == IPC_STREAMING_STARTED_EVENT ]]; then
+      wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+      assert_file_exists "$TEST_ROOT/state/guard-paused"
+    else
+      wait_for_log "GFN stream inactive; Arq resumed"
+      assert_file_missing "$TEST_ROOT/state/guard-paused"
+    fi
+  done
+  kill "$monitor_pid"
+  wait "$monitor_pid" 2>/dev/null || true
+  monitor_pid=""
+done
+
+# A growing log can push the start marker outside the one-MiB scan window.
+# Ownership must still renew the lease, then a new end marker must resume it.
+: > "$TEST_ROOT/guard.log"
+print -r -- "IPC_STREAMING_STARTED_EVENT" > "$TEST_ROOT/gfn.log"
+run_guard 1 10000
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+run_guard 1 10240
+[[ "$(<"$TEST_ROOT/state/guard-paused")" == "10240" ]] || {
+  print -u2 -- "Growing log lost the owned pause lease"
+  exit 1
+}
+print -r -- "IPC_STREAMING_MODE_EXIT_EVENT" >> "$TEST_ROOT/gfn.log"
+run_guard 1 10250
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+assert_log_contains "DRY-RUN arqc resumeBackups"
 
 print -r -- "All Arq GFN guard tests passed"
