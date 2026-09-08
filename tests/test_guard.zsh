@@ -551,4 +551,56 @@ run_guard 1 10250
 assert_file_missing "$TEST_ROOT/state/guard-paused"
 assert_log_contains "DRY-RUN arqc resumeBackups"
 
+# Real filesystem recovery in a persistent process; only the Arq I/O is fake.
+recovery_root="$TEST_ROOT/recovery"
+mkdir -p "$recovery_root"
+fake_recovery_arqc="$recovery_root/arqc"
+print '#!/bin/zsh' > "$fake_recovery_arqc"
+print 'print -r -- "$*" >> "$ARQC_CALLS"' >> "$fake_recovery_arqc"
+print 'exit "${ARQC_EXIT:-0}"' >> "$fake_recovery_arqc"
+chmod +x "$fake_recovery_arqc"
+wait_for_calls() {
+  local expected="$1" attempt
+  for attempt in {1..50}; do
+    if [[ -f "$recovery_root/calls" ]] && grep -Fq -- "$expected" "$recovery_root/calls"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  print -u2 -- "Missing Arq call: $expected"
+  return 1
+}
+print IPC_STREAMING_MODE_EXIT_EVENT > "$recovery_root/gfn.log"
+ARQ_GFN_ARQC="$fake_recovery_arqc" ARQC_CALLS="$recovery_root/calls" \
+ARQ_GFN_FORCE_PROCESS=1 ARQ_GFN_LOG_FILE="$recovery_root/gfn.log" \
+ARQ_GFN_STATE_DIR="$recovery_root/state" ARQ_GFN_GUARD_LOG="$recovery_root/logs/guard.log" \
+ARQ_GFN_LOOP_SECONDS=1 ARQ_GFN_SAFETY_SECONDS=1 "$GUARD_SCRIPT" &
+monitor_pid=$!
+sleep 1.2
+rm -rf "$recovery_root/logs" "$recovery_root/state"
+print IPC_STREAMING_STARTED_EVENT > "$recovery_root/gfn.log"
+wait_for_calls 'pauseBackups 10'
+sleep 0.2
+assert_file_exists "$recovery_root/state/guard-paused"
+assert_file_exists "$recovery_root/logs/guard.log"
+# An unusable log destination must not suppress resume or subsequent pause.
+rm -rf "$recovery_root/logs"
+print blocked > "$recovery_root/logs"
+print IPC_STREAMING_MODE_EXIT_EVENT > "$recovery_root/gfn.log"
+wait_for_calls resumeBackups
+sleep 0.2
+assert_file_missing "$recovery_root/state/guard-paused"
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+: > "$recovery_root/calls"
+print IPC_STREAMING_STARTED_EVENT > "$recovery_root/gfn.log"
+ARQ_GFN_ARQC="$fake_recovery_arqc" ARQC_CALLS="$recovery_root/calls" ARQC_EXIT=42 \
+ARQ_GFN_FORCE_PROCESS=1 ARQ_GFN_LOG_FILE="$recovery_root/gfn.log" \
+ARQ_GFN_STATE_DIR="$recovery_root/state" ARQ_GFN_GUARD_LOG="$recovery_root/logs/guard.log" \
+ARQ_GFN_GUARD_ONCE=1 "$GUARD_SCRIPT" 2> "$recovery_root/stderr"
+wait_for_calls 'pauseBackups 10'
+assert_file_missing "$recovery_root/state/guard-paused"
+grep -Fq 'failed with exit code 42' "$recovery_root/stderr"
+
 print -r -- "All Arq GFN guard tests passed"

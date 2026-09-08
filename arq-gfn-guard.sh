@@ -68,9 +68,23 @@ timestamp() {
   /bin/date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || print -r -- "UNKNOWN_TIME"
 }
 
-log_message() {
-  print -r -- "$(timestamp) $1" >> "$GUARD_LOG"
+# Open before invoking Arq: a failed redirection must never skip the command.
+# The descriptor also remains usable if cleanup unlinks the log after opening.
+open_guard_log() {
+  mkdir -p "${GUARD_LOG:h}" 2>/dev/null || return 1
+  chmod 700 "${GUARD_LOG:h}" 2>/dev/null || true
+  { exec {guard_log_fd}>> "$GUARD_LOG"; } 2>/dev/null || return 1
   chmod 600 "$GUARD_LOG" 2>/dev/null || true
+}
+
+log_message() {
+  local guard_log_fd
+  if open_guard_log; then
+    print -r -- "$(timestamp) $1" >&$guard_log_fd
+    exec {guard_log_fd}>&-
+  else
+    print -ru2 -- "$(timestamp) $1"
+  fi
 }
 
 notify_user() {
@@ -166,6 +180,11 @@ read_state_timestamp() {
 write_state_timestamp() {
   local epoch_value="$1"
   local temporary_state
+  mkdir -p "$STATE_DIR" 2>/dev/null || {
+    log_message "ERROR: could not recreate state directory"
+    return 1
+  }
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
   temporary_state="$(/usr/bin/mktemp "$STATE_DIR/.guard-paused.XXXXXX")" || {
     log_message "ERROR: could not create temporary state file"
     return 1
@@ -194,8 +213,16 @@ run_arqc() {
     return 1
   fi
 
-  "$ARQC" "$@" >> "$GUARD_LOG" 2>&1
-  local arqc_exit=$?
+  local guard_log_fd arqc_exit
+  if open_guard_log; then
+    "$ARQC" "$@" >&$guard_log_fd 2>&1
+    arqc_exit=$?
+    exec {guard_log_fd}>&-
+  else
+    print -ru2 -- "WARN: guard log unavailable; invoking arqc with stderr output"
+    "$ARQC" "$@" >&2
+    arqc_exit=$?
+  fi
   if (( arqc_exit != 0 )); then
     log_message "ERROR: arqc ${1:-unknown} failed with exit code $arqc_exit"
     return "$arqc_exit"
