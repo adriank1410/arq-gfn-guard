@@ -162,14 +162,15 @@ parse_stream_state() {
   ' "$@"
 }
 
-# Cache belongs to this process, not the pause lease. On restart or replacement
-# of the source file, recover from the log instead of trusting old ownership.
+# Parsed state is process-local. The lease persists only source evidence so
+# restart recovery can identify its rotated log, never assume an active state.
 parsed_signature=""
 parsed_identity=""
 parsed_size=0
 parsed_stream_state=""
 parsed_prefix=""
 parsed_suffix=""
+current_source_event=0
 
 # Compare small byte checkpoints before trusting append-only growth. Reading
 # at the OLD size detects copytruncate/regrowth without scanning the prefix.
@@ -204,7 +205,12 @@ latest_stream_state() {
     parsed_signature=""
     return 0
   }
-  if [[ "$source_signature" == "$parsed_signature" ]]; then
+  if [[ "$source_signature" == "$parsed_signature" ]] \
+      && log_checkpoint "$parsed_size" \
+      && [[ "$checkpoint_prefix_out" == "$parsed_prefix" \
+         && "$checkpoint_suffix_out" == "$parsed_suffix" ]]; then
+    # Safety reconciliation also reaches this check, detecting a same-size
+    # rewrite hidden by stat mtime resolution even if the file stays quiet.
     detected_stream_state_out="$parsed_stream_state"
     return 0
   fi
@@ -227,13 +233,17 @@ latest_stream_state() {
     recover=1
   fi
 
+  current_source_event=0
   detected_state="$(/usr/bin/tail -c "$LOG_SCAN_BYTES" "$GFN_LOG_FILE" 2>/dev/null | parse_stream_state)" || return 0
   if [[ -z "$detected_state" ]] && (( recover )); then
     # Full scans are for startup, rotation/truncation, and unseen bursts that
     # could have pushed an end outside the tail. Ordinary appends retain the
     # last parsed state instead of repeatedly scanning the entire file.
     detected_state="$(parse_stream_state "$GFN_LOG_FILE" 2>/dev/null)" || return 0
-  elif [[ -z "$detected_state" ]]; then
+  fi
+  if [[ -n "$detected_state" ]]; then
+    current_source_event=1
+  elif (( ! recover )); then
     detected_state="$parsed_stream_state"
   fi
   if [[ -z "$detected_state" ]] && (( replacement && parsed_size > 0 )); then
@@ -299,6 +309,35 @@ read_state_timestamp() {
   state_epoch_out="$saved_epoch"
 }
 
+# The first line remains the legacy renewal timestamp. An optional versioned
+# header and two raw byte checkpoints follow; no stored text is evaluated.
+restore_source_checkpoint() {
+  [[ "$has_system" == true && -f "$STATE_FILE" ]] || return 1
+  local proof_fd saved_epoch proof_version proof_identity proof_size extra
+  local prefix_data suffix_data chunk_size bytes_read
+  { exec {proof_fd}< "$STATE_FILE"; } 2>/dev/null || return 1
+  {
+    IFS= read -r -u "$proof_fd" saved_epoch || return 1
+    IFS=' ' read -r -u "$proof_fd" proof_version proof_identity proof_size extra || return 1
+    [[ "$saved_epoch" =~ ^[0-9]+$ && ${#saved_epoch} -le 18 \
+       && "$proof_version" == source-v1 && -z "$extra" \
+       && "$proof_identity" =~ ^[0-9]{1,18}:[0-9]{1,18}$ \
+       && "$proof_size" =~ ^[0-9]+$ && ${#proof_size} -le 18 ]] || return 1
+    (( proof_size > 0 )) || return 1
+    chunk_size=$(( proof_size < CHECKPOINT_BYTES ? proof_size : CHECKPOINT_BYTES ))
+    sysread -i "$proof_fd" -s "$chunk_size" -c bytes_read prefix_data || return 1
+    (( bytes_read == chunk_size )) || return 1
+    sysread -i "$proof_fd" -s "$chunk_size" -c bytes_read suffix_data || return 1
+    (( bytes_read == chunk_size )) || return 1
+    parsed_identity="$proof_identity"
+    parsed_size="$proof_size"
+    parsed_prefix="$prefix_data"
+    parsed_suffix="$suffix_data"
+  } always {
+    exec {proof_fd}<&-
+  }
+}
+
 write_state_timestamp() {
   local epoch_value="$1"
   local temporary_state
@@ -311,7 +350,17 @@ write_state_timestamp() {
     log_message "ERROR: could not create temporary state file"
     return 1
   }
-  if ! print -r -- "$epoch_value" > "$temporary_state"; then
+  if ! {
+    print -r -- "$epoch_value" && {
+      if (( current_source_event && parsed_size > 0 )) && [[ -n "$parsed_signature" ]]; then
+        print -r -- "source-v1 $parsed_identity $parsed_size" \
+          && print -rn -- "$parsed_prefix$parsed_suffix"
+      elif [[ -f "$STATE_FILE" ]]; then
+        # Keep the last proven source while rotation hides current events.
+        /usr/bin/tail -n +2 "$STATE_FILE"
+      fi
+    }
+  } > "$temporary_state"; then
     rm -f "$temporary_state"
     log_message "ERROR: could not write temporary state file"
     return 1
@@ -380,6 +429,16 @@ reconcile_backup_state() {
         || [[ -f "$STATE_FILE" && "$detected_stream_state" != "inactive" ]]; then
       current_stream_state="active"
     fi
+  else
+    # Do not carry old stream evidence into a new launcher process after
+    # a crash/quit. Its startup rotation may retain an old active .bak.
+    parsed_signature=""
+    parsed_identity=""
+    parsed_size=0
+    parsed_stream_state=""
+    parsed_prefix=""
+    parsed_suffix=""
+    current_source_event=0
   fi
 
   if [[ "$current_stream_state" == "active" ]]; then
@@ -456,6 +515,8 @@ guard_sleep() {
     /bin/sleep "$LOOP_SECONDS"
   fi
 }
+
+restore_source_checkpoint || true
 
 last_signature=""
 iterations_since_reconcile=$SAFETY_ITERATIONS

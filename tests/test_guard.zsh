@@ -341,7 +341,7 @@ pause_count="$(/usr/bin/grep -Fc 'DRY-RUN arqc pauseBackups 10' "$TEST_ROOT/guar
 print -r -- 'not-a-timestamp' > "$TEST_ROOT/state/guard-paused"
 : > "$TEST_ROOT/guard.log"
 run_guard 1 5000
-[[ "$(<"$TEST_ROOT/state/guard-paused")" == "5000" ]] || {
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "5000" ]] || {
   print -u2 -- "Corrupt state timestamp was not repaired"
   exit 1
 }
@@ -352,7 +352,7 @@ assert_log_contains "invalid state timestamp"
 print -r -- '9999999999999999999999999999999999999999' > "$TEST_ROOT/state/guard-paused"
 : > "$TEST_ROOT/guard.log"
 run_guard 1 5100
-[[ "$(<"$TEST_ROOT/state/guard-paused")" == "5100" ]] || {
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "5100" ]] || {
   print -u2 -- "Out-of-range state timestamp was not repaired"
   exit 1
 }
@@ -363,7 +363,7 @@ assert_log_contains "invalid state timestamp"
 print -r -- '9000' > "$TEST_ROOT/state/guard-paused"
 : > "$TEST_ROOT/guard.log"
 run_guard 1 5000
-[[ "$(<"$TEST_ROOT/state/guard-paused")" == "5000" ]] || {
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "5000" ]] || {
   print -u2 -- "Future state timestamp was not repaired"
   exit 1
 }
@@ -425,7 +425,7 @@ ARQ_GFN_GUARD_LOG="$TEST_ROOT/fresh-clock.log" \
 ARQ_GFN_GUARD_ONCE=1 \
 FAKE_DATE_CALL_LOG="$TEST_ROOT/date.calls" \
 "$fresh_clock_guard"
-[[ "$(<"$TEST_ROOT/fresh-clock-state/guard-paused")" == "7000" ]] || {
+[[ "$(head -n 1 "$TEST_ROOT/fresh-clock-state/guard-paused")" == "7000" ]] || {
   print -u2 -- "Guard did not use a fresh wall-clock timestamp"
   exit 1
 }
@@ -542,7 +542,7 @@ run_guard 1 10000
 /usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
 print >> "$TEST_ROOT/gfn.log"
 run_guard 1 10240
-[[ "$(<"$TEST_ROOT/state/guard-paused")" == "10240" ]] || {
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "10240" ]] || {
   print -u2 -- "Growing log lost the owned pause lease"
   exit 1
 }
@@ -616,7 +616,7 @@ assert_file_exists "$TEST_ROOT/state/guard-paused"
 assert_log_contains "DRY-RUN arqc pauseBackups 10"
 console_event Streaming >> "$TEST_ROOT/gfn.log"
 run_guard 1 20240
-[[ "$(<"$TEST_ROOT/state/guard-paused")" == "20240" ]]
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "20240" ]]
 for end_state in PostSessionConnection PostStreaming Done; do
   console_event "$end_state" >> "$TEST_ROOT/gfn.log"
   run_guard 1 20250
@@ -687,10 +687,10 @@ run_guard 1 30000
 /usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
 print >> "$TEST_ROOT/gfn.log"
 run_guard 1 30240
-[[ "$(<"$TEST_ROOT/state/guard-paused")" == "30240" ]]
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "30240" ]]
 rm "$TEST_ROOT/gfn.log"
 run_guard 1 30480
-[[ "$(<"$TEST_ROOT/state/guard-paused")" == "30480" ]]
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "30480" ]]
 console_event Done > "$TEST_ROOT/gfn.log"
 run_guard 1 30490
 assert_file_missing "$TEST_ROOT/state/guard-paused"
@@ -846,6 +846,80 @@ kill -CONT "$monitor_pid"
 assert_file_exists "$TEST_ROOT/state/guard-paused"
 console_event Done >> "$TEST_ROOT/gfn.log"
 wait_for_log "GFN stream inactive; Arq resumed"
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+
+# Safety reconciliation must validate content even when size, inode and
+# whole-second mtime remain identical across an in-place rewrite.
+: > "$TEST_ROOT/guard.log"
+printf '%-180s\n' "$(console_event Done)" > "$TEST_ROOT/gfn.log"
+cp -p "$TEST_ROOT/gfn.log" "$TEST_ROOT/unchanged-stamp"
+start_monitor 1
+/bin/sleep 1.2
+printf '%-180s\n' "$(console_event Streaming)" > "$TEST_ROOT/gfn.log"
+touch -r "$TEST_ROOT/unchanged-stamp" "$TEST_ROOT/gfn.log"
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+printf '%-180s\n' "$(console_event Done)" > "$TEST_ROOT/gfn.log"
+touch -r "$TEST_ROOT/unchanged-stamp" "$TEST_ROOT/gfn.log"
+wait_for_log "GFN stream inactive; Arq resumed"
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+
+# Persist source evidence with the owned lease, then recover an end rotated
+# while the guard was stopped. No cached in-process identity is available.
+console_event Streaming > "$TEST_ROOT/gfn.log"
+run_guard 1 50000
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+console_event Done >> "$TEST_ROOT/gfn.log"
+mv -f "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+print 'new console with no transition' > "$TEST_ROOT/gfn.log"
+run_guard 1 50010
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
+# Malformed/truncated optional source evidence must not affect the legacy
+# timestamp reader or prevent reconciliation against the real current log.
+for proof_header in 'source-v1 invalid 20' 'source-v1 1:2 invalid' 'source-v1 1:2 999999999999999999999999' 'source-v1 1:2 128'; do
+  printf '1\n%s\nshort\n' "$proof_header" > "$TEST_ROOT/state/guard-paused"
+  console_event Streaming > "$TEST_ROOT/gfn.log"
+  run_guard 1 51000
+  [[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == 51000 ]]
+  console_event Done >> "$TEST_ROOT/gfn.log"
+  run_guard 1 51010
+  assert_file_missing "$TEST_ROOT/state/guard-paused"
+done
+
+# A closed GFN process ends the old observation epoch. Reopening just the
+# launcher must not resurrect an active marker from the previous process bak.
+process_probe="$TEST_ROOT/process-probe"
+cat > "$process_probe" <<'PROCESS_PROBE'
+#!/bin/zsh
+[[ "$(<"$GFN_PROBE_FILE")" == running ]]
+PROCESS_PROBE
+chmod +x "$process_probe"
+process_guard="$TEST_ROOT/process-guard.zsh"
+sed "s#/usr/bin/pgrep#$process_probe#g" "$GUARD_SCRIPT" > "$process_guard"
+chmod +x "$process_guard"
+print running > "$TEST_ROOT/process-state"
+console_event Streaming > "$TEST_ROOT/gfn.log"
+: > "$TEST_ROOT/guard.log"
+GFN_PROBE_FILE="$TEST_ROOT/process-state" ARQ_GFN_GUARD_DRY_RUN=1 \
+ARQ_GFN_LOG_FILE="$TEST_ROOT/gfn.log" ARQ_GFN_STATE_DIR="$TEST_ROOT/state" \
+ARQ_GFN_GUARD_LOG="$TEST_ROOT/guard.log" ARQ_GFN_LOOP_SECONDS=1 \
+ARQ_GFN_SAFETY_SECONDS=1 "$process_guard" &
+monitor_pid=$!
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+print stopped > "$TEST_ROOT/process-state"
+wait_for_log "GFN stream inactive; Arq resumed"
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+kill -STOP "$monitor_pid"
+mv -f "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+print 'new launcher only' > "$TEST_ROOT/gfn.log"
+print running > "$TEST_ROOT/process-state"
+kill -CONT "$monitor_pid"
+/bin/sleep 2
+assert_file_missing "$TEST_ROOT/state/guard-paused"
 kill "$monitor_pid"
 wait "$monitor_pid" 2>/dev/null || true
 monitor_pid=""
