@@ -18,6 +18,7 @@ readonly RENEW_SECONDS=240
 readonly LOOP_SECONDS="${ARQ_GFN_LOOP_SECONDS:-2}"
 readonly SAFETY_SECONDS="${ARQ_GFN_SAFETY_SECONDS:-60}"
 readonly LOG_SCAN_BYTES=1048576
+readonly CHECKPOINT_BYTES=128
 readonly NOTIFICATIONS_ENABLED="${ARQ_GFN_NOTIFICATIONS:-0}"
 readonly NOTIFICATION_LANGUAGE="${ARQ_GFN_LANG:-}"
 
@@ -45,6 +46,11 @@ chmod 700 "$STATE_DIR" "${GUARD_LOG:h}" 2>/dev/null || true
 has_stat=false
 if zmodload zsh/stat 2>/dev/null; then
   has_stat=true
+fi
+
+has_system=false
+if zmodload zsh/system 2>/dev/null; then
+  has_system=true
 fi
 
 has_zselect=false
@@ -162,6 +168,32 @@ parsed_signature=""
 parsed_identity=""
 parsed_size=0
 parsed_stream_state=""
+parsed_prefix=""
+parsed_suffix=""
+
+# Compare small byte checkpoints before trusting append-only growth. Reading
+# at the OLD size detects copytruncate/regrowth without scanning the prefix.
+# zsh/system avoids spawning extra processes for these bounded reads.
+log_checkpoint() {
+  local source_size="$1"
+  local checkpoint_file="${2:-$GFN_LOG_FILE}"
+  local chunk_size=$(( source_size < CHECKPOINT_BYTES ? source_size : CHECKPOINT_BYTES ))
+  local checkpoint_fd bytes_read
+  checkpoint_prefix_out=""
+  checkpoint_suffix_out=""
+  [[ "$has_system" == true ]] || return 1
+  (( chunk_size > 0 )) || return 0
+  { exec {checkpoint_fd}< "$checkpoint_file"; } 2>/dev/null || return 1
+  {
+    sysread -i "$checkpoint_fd" -s "$chunk_size" -c bytes_read checkpoint_prefix_out || return 1
+    (( bytes_read == chunk_size )) || return 1
+    sysseek -u "$checkpoint_fd" $(( source_size - chunk_size )) || return 1
+    sysread -i "$checkpoint_fd" -s "$chunk_size" -c bytes_read checkpoint_suffix_out || return 1
+    (( bytes_read == chunk_size )) || return 1
+  } always {
+    exec {checkpoint_fd}<&-
+  }
+}
 
 latest_stream_state() {
   setopt localoptions pipefail
@@ -180,9 +212,18 @@ latest_stream_state() {
   local source_identity="${source_signature%:*}"
   source_identity="${source_identity%:*}"
   local source_size="${source_signature##*:}"
-  local recover=0 detected_state
-  if [[ -z "$parsed_signature" || "$source_identity" != "$parsed_identity" ]] \
-      || (( source_size <= parsed_size || source_size - parsed_size >= LOG_SCAN_BYTES )); then
+  local recover=0 replacement=0 detected_state
+  if [[ -n "$parsed_identity" ]]; then
+    if [[ "$source_identity" != "$parsed_identity" ]] || (( source_size <= parsed_size )); then
+      replacement=1
+    elif ! log_checkpoint "$parsed_size" \
+        || [[ "$checkpoint_prefix_out" != "$parsed_prefix" \
+           || "$checkpoint_suffix_out" != "$parsed_suffix" ]]; then
+      replacement=1
+    fi
+  fi
+  if [[ -z "$parsed_signature" ]] \
+      || (( replacement || source_size - parsed_size >= LOG_SCAN_BYTES )); then
     recover=1
   fi
 
@@ -195,7 +236,31 @@ latest_stream_state() {
   elif [[ -z "$detected_state" ]]; then
     detected_state="$parsed_stream_state"
   fi
-  parsed_signature="$source_signature"
+  if [[ -z "$detected_state" ]] && (( replacement && parsed_size > 0 )); then
+    # A last end event may have moved to .bak before we saw it. Only trust
+    # the prior source inode, or a copy matching its recorded checkpoints;
+    # an unrelated backup from an older session must never resume Arq.
+    local backup_file="$GFN_LOG_FILE.bak"
+    log_signature "$backup_file"
+    if [[ "$log_signature_out" != missing && "$log_signature_out" != unreadable ]]; then
+      local backup_identity="${log_signature_out%:*}"
+      backup_identity="${backup_identity%:*}"
+      local backup_size="${log_signature_out##*:}"
+      if [[ "$backup_identity" == "$parsed_identity" ]] \
+          || { (( backup_size >= parsed_size )) \
+               && log_checkpoint "$parsed_size" "$backup_file" \
+               && [[ "$checkpoint_prefix_out" == "$parsed_prefix" \
+                  && "$checkpoint_suffix_out" == "$parsed_suffix" ]]; }; then
+        detected_state="$(parse_stream_state "$backup_file" 2>/dev/null)" || detected_state=""
+      fi
+    fi
+  fi
+  parsed_signature=""
+  if log_checkpoint "$source_size"; then
+    parsed_prefix="$checkpoint_prefix_out"
+    parsed_suffix="$checkpoint_suffix_out"
+    parsed_signature="$source_signature"
+  fi
   parsed_identity="$source_identity"
   parsed_size="$source_size"
   parsed_stream_state="$detected_state"
@@ -203,21 +268,22 @@ latest_stream_state() {
 }
 
 log_signature() {
-  [[ -f "$GFN_LOG_FILE" ]] || {
+  local signature_file="${1:-$GFN_LOG_FILE}"
+  [[ -f "$signature_file" ]] || {
     log_signature_out="missing"
     return 0
   }
 
   if [[ "$has_stat" == true ]]; then
     local -A file_stat
-    zstat -H file_stat -- "$GFN_LOG_FILE" 2>/dev/null || {
+    zstat -H file_stat -- "$signature_file" 2>/dev/null || {
       log_signature_out="unreadable"
       return 0
     }
     # Rotation may preserve both size and mtime; include the file identity.
     log_signature_out="${file_stat[device]}:${file_stat[inode]}:${file_stat[mtime]}:${file_stat[size]}"
   else
-    log_signature_out="$(/usr/bin/stat -f '%d:%i:%m:%z' "$GFN_LOG_FILE" 2>/dev/null)" \
+    log_signature_out="$(/usr/bin/stat -f '%d:%i:%m:%z' "$signature_file" 2>/dev/null)" \
       || log_signature_out="unreadable"
   fi
 }

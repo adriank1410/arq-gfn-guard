@@ -771,4 +771,83 @@ wait "$monitor_pid" 2>/dev/null || true
 monitor_pid=""
 unset ARQ_AWK_SOURCE ARQ_AWK_LOG
 
+# copytruncate can regrow past its previous size before the next poll. Size
+# growth alone does not prove append-only writes; the cached end must clear.
+console_event Done > "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1000000 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+: > "$TEST_ROOT/guard.log"
+start_monitor 1
+/bin/sleep 1.5
+kill -STOP "$monitor_pid"
+console_event Streaming > "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+kill -CONT "$monitor_pid"
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+
+# Missing zsh/system must use recovery scans instead of trusting an
+# unchecked cache. The actual awk parser and file I/O still execute.
+system_fallback_guard="$TEST_ROOT/system-fallback.zsh"
+rm -f "$TEST_ROOT/state/guard-paused"
+sed 's@zmodload zsh/system@zmodload zsh/arq_gfn_missing_system@' \
+  "$GUARD_SCRIPT" > "$system_fallback_guard"
+chmod +x "$system_fallback_guard"
+: > "$TEST_ROOT/guard.log"
+console_event Done > "$TEST_ROOT/gfn.log"
+start_monitor 1 "$system_fallback_guard"
+/bin/sleep 1.2
+console_event Streaming >> "$TEST_ROOT/gfn.log"
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+console_event Done >> "$TEST_ROOT/gfn.log"
+wait_for_log "GFN stream inactive; Arq resumed"
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+
+# Recover an end written just before rename rotation or copytruncate.
+for rotation_mode in rename copy; do
+  : > "$TEST_ROOT/guard.log"
+  console_event Streaming > "$TEST_ROOT/gfn.log"
+  start_monitor 1
+  wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+  kill -STOP "$monitor_pid"
+  console_event Done >> "$TEST_ROOT/gfn.log"
+  if [[ "$rotation_mode" == rename ]]; then
+    mv -f "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+  else
+    cp "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+  fi
+  print 'new console; no session transition yet' > "$TEST_ROOT/gfn.log"
+  kill -CONT "$monitor_pid"
+  wait_for_log "GFN stream inactive; Arq resumed"
+  assert_file_missing "$TEST_ROOT/state/guard-paused"
+  kill "$monitor_pid"
+  wait "$monitor_pid" 2>/dev/null || true
+  monitor_pid=""
+done
+
+# A stale unrelated .bak must never supply an end for the current session.
+: > "$TEST_ROOT/guard.log"
+console_event Streaming > "$TEST_ROOT/gfn.log"
+console_event Done > "$TEST_ROOT/gfn.log.bak"
+start_monitor 1
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+kill -STOP "$monitor_pid"
+mv "$TEST_ROOT/gfn.log" "$TEST_ROOT/unrelated-rotation.log"
+print 'new console; no session transition yet' > "$TEST_ROOT/gfn.log"
+kill -CONT "$monitor_pid"
+/bin/sleep 2
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+console_event Done >> "$TEST_ROOT/gfn.log"
+wait_for_log "GFN stream inactive; Arq resumed"
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+
 print -r -- "All Arq GFN guard tests passed"

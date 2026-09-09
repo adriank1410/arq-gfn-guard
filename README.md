@@ -163,7 +163,7 @@ Run from the repository in `zsh`. This simulates a session start in temporary fi
 
 - Fixed system-only `PATH` and absolute paths for security-sensitive commands.
 - Private state and logs (`700` directories and `600` files).
-- Atomic state writes and automatic guard-log rotation. Detection reads at most the last 1 MiB after ordinary appends and caches the last parsed state. If that window has no event, a full streaming scan is reserved for startup, file replacement/truncation, or an unseen burst of at least 1 MiB. Unchanged files use the cache. Recovery takes time proportional to file size without buffering the whole file.
+- Atomic state writes and automatic guard-log rotation. Detection reads at most the last 1 MiB after ordinary appends and caches the last parsed state. If that window has no event, a full streaming scan is reserved for startup, file replacement/truncation, or an unseen burst of at least 1 MiB. If a replacement log has no event yet, the guard also inspects its `.bak` only when its inode or recorded byte checkpoints match the previously observed source. This recovers an end moved out during rotation without trusting an unrelated old backup. Unchanged files use the cache. Before reusing state after an append, `zsh/system` checks the first 128 bytes and 128 bytes at the previous end to detect replacement content after copytruncate/regrowth. If that module or the checkpoint read is unavailable, changed files fall back to recovery scans. Recovery takes time proportional to file size without buffering the whole file.
 - Notification text reaches AppleScript as an argument, never interpolated code.
 - No game titles, account data, log contents, or telemetry are sent anywhere.
 
