@@ -163,7 +163,7 @@ Uruchom w `zsh` z katalogu repo. Przykład symuluje start sesji na plikach tymcz
 
 - Stały systemowy `PATH` i absolutne ścieżki poleceń istotnych dla bezpieczeństwa.
 - Prywatny stan i logi: katalogi `700`, pliki `600`.
-- Atomowy zapis stanu i automatyczna rotacja logu guarda. Detekcja zwykle czyta ostatni 1 MiB; jeśli nie znajdzie zdarzenia sesji, skanuje bieżący log od początku, aby odzyskać starszy początek lub koniec. Ten odczyt jest strumieniowy (bez buforowania całego pliku), a jego czas rośnie proporcjonalnie do rozmiaru pliku.
+- Atomowy zapis stanu i automatyczna rotacja logu guarda. Po zwykłym dopisaniu danych detekcja czyta najwyżej ostatni 1 MiB i pamięta ostatni rozpoznany stan. Jeśli w tym oknie nie ma zdarzenia, pełny odczyt strumieniowy następuje tylko przy starcie, wymianie/skróceniu pliku albo po przyroście co najmniej 1 MiB od ostatniej analizy. Niezmieniony plik korzysta z pamięci podręcznej. Odtworzenie stanu trwa proporcjonalnie do rozmiaru pliku, bez buforowania go w całości.
 - Tekst powiadomienia trafia do AppleScript jako argument, a nie fragment kodu.
 - Tytuły gier, dane konta, treść logu ani telemetria nie są nigdzie wysyłane.
 

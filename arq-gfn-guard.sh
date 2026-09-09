@@ -135,37 +135,71 @@ gfn_process_state() {
 }
 
 parse_stream_state() {
-  /usr/bin/awk -v legacy_log="${ARQ_GFN_LOG_FILE:+1}" '
+  /usr/bin/awk '
     / INFO +gfn\/StreamerManagerService +Advancing to state: (Loading|Streaming)[[:space:]]*$/ {
       stream_state = "active"
     }
     / INFO +gfn\/StreamerManagerService +Advancing to state: (PostSessionConnection|PostStreaming|Done)[[:space:]]*$/ {
       stream_state = "inactive"
     }
-    # Retain support for explicitly supplied legacy reliability logs.
-    legacy_log && /IPC_STREAMING_(PREPARE|STARTING|SESSION_SETUP|STARTED)_EVENT|streaming started/ {
+    # Legacy events require their own format, independently of the pathname.
+    # Bare IPC event lines are useful for diagnostics and isolated fixtures.
+    /^[[:space:]]*IPC_STREAMING_(PREPARE|STARTING|SESSION_SETUP|STARTED)_EVENT[[:space:]]*$/ ||
+    (/gfn_streamer_diagnostics[.]cpp[(][0-9]+[)]/ && /IPC_STREAMING_(PREPARE|STARTING|SESSION_SETUP|STARTED)_EVENT|streaming started/) {
       stream_state = "active"
     }
-    legacy_log && /IPC_STREAMING_(TERMINATED|MODE_EXIT)_EVENT|streaming terminated|GFN UI exited streaming mode/ {
+    /^[[:space:]]*IPC_STREAMING_(TERMINATED|MODE_EXIT)_EVENT[[:space:]]*$/ ||
+    (/gfn_streamer_diagnostics[.]cpp[(][0-9]+[)]/ && /IPC_STREAMING_(TERMINATED|MODE_EXIT)_EVENT|streaming terminated|GFN UI exited streaming mode/) {
       stream_state = "inactive"
     }
     END { print stream_state }
   ' "$@"
 }
 
-latest_stream_state() {
-  [[ -f "$GFN_LOG_FILE" ]] || return 0
+# Cache belongs to this process, not the pause lease. On restart or replacement
+# of the source file, recover from the log instead of trusting old ownership.
+parsed_signature=""
+parsed_identity=""
+parsed_size=0
+parsed_stream_state=""
 
-  local detected_state
-  detected_state="$(/usr/bin/tail -c "$LOG_SCAN_BYTES" "$GFN_LOG_FILE" 2>/dev/null | parse_stream_state)"
-  if [[ -n "$detected_state" ]]; then
-    print -r -- "$detected_state"
-  else
-    # A chatty console can push even an unobserved end past the fast scan.
-    # Stream the full current log only in that case; never infer an active
-    # session from ownership while a readable older end event is available.
-    parse_stream_state "$GFN_LOG_FILE" 2>/dev/null
+latest_stream_state() {
+  setopt localoptions pipefail
+  local source_signature="$1"
+  detected_stream_state_out=""
+  [[ -f "$GFN_LOG_FILE" && "$source_signature" != missing \
+      && "$source_signature" != unreadable ]] || {
+    parsed_signature=""
+    return 0
+  }
+  if [[ "$source_signature" == "$parsed_signature" ]]; then
+    detected_stream_state_out="$parsed_stream_state"
+    return 0
   fi
+
+  local source_identity="${source_signature%:*}"
+  source_identity="${source_identity%:*}"
+  local source_size="${source_signature##*:}"
+  local recover=0 detected_state
+  if [[ -z "$parsed_signature" || "$source_identity" != "$parsed_identity" ]] \
+      || (( source_size <= parsed_size || source_size - parsed_size >= LOG_SCAN_BYTES )); then
+    recover=1
+  fi
+
+  detected_state="$(/usr/bin/tail -c "$LOG_SCAN_BYTES" "$GFN_LOG_FILE" 2>/dev/null | parse_stream_state)" || return 0
+  if [[ -z "$detected_state" ]] && (( recover )); then
+    # Full scans are for startup, rotation/truncation, and unseen bursts that
+    # could have pushed an end outside the tail. Ordinary appends retain the
+    # last parsed state instead of repeatedly scanning the entire file.
+    detected_state="$(parse_stream_state "$GFN_LOG_FILE" 2>/dev/null)" || return 0
+  elif [[ -z "$detected_state" ]]; then
+    detected_state="$parsed_stream_state"
+  fi
+  parsed_signature="$source_signature"
+  parsed_identity="$source_identity"
+  parsed_size="$source_size"
+  parsed_stream_state="$detected_state"
+  detected_stream_state_out="$detected_state"
 }
 
 log_signature() {
@@ -253,6 +287,7 @@ run_arqc() {
 
 reconcile_backup_state() {
   local now_epoch="$1"
+  local source_signature="$2"
   local detected_stream_state=""
   local current_stream_state="inactive"
   local process_state="unknown"
@@ -262,7 +297,8 @@ reconcile_backup_state() {
   gfn_process_state
   process_state="$gfn_process_state_out"
   if [[ "$process_state" == "running" ]]; then
-    detected_stream_state="$(latest_stream_state)"
+    latest_stream_state "$source_signature"
+    detected_stream_state="$detected_stream_state_out"
     if [[ "$detected_stream_state" == "active" ]]; then
       current_stream_state="active"
     elif [[ -f "$STATE_FILE" && "$detected_stream_state" != "inactive" ]]; then
@@ -272,7 +308,8 @@ reconcile_backup_state() {
     fi
   elif [[ "$process_state" == "unknown" ]]; then
     log_message "WARN: could not determine whether the GFN process is running"
-    detected_stream_state="$(latest_stream_state)"
+    latest_stream_state "$source_signature"
+    detected_stream_state="$detected_stream_state_out"
     if [[ "$detected_stream_state" == "active" ]] \
         || [[ -f "$STATE_FILE" && "$detected_stream_state" != "inactive" ]]; then
       current_stream_state="active"
@@ -377,7 +414,7 @@ while true; do
       exit 2
     }
     now_epoch="$epoch_value_out"
-    reconcile_backup_state "$now_epoch"
+    reconcile_backup_state "$now_epoch" "$current_signature"
     last_signature="$current_signature"
     iterations_since_reconcile=0
     rotate_log_if_needed

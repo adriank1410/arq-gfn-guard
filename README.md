@@ -163,7 +163,7 @@ Run from the repository in `zsh`. This simulates a session start in temporary fi
 
 - Fixed system-only `PATH` and absolute paths for security-sensitive commands.
 - Private state and logs (`700` directories and `600` files).
-- Atomic state writes and automatic guard-log rotation. Detection normally reads the last 1 MiB; if no session event is found, it scans the current log from the beginning to recover an older start or end. This fallback uses streaming input (no whole-file buffer), with time proportional to the file size.
+- Atomic state writes and automatic guard-log rotation. Detection reads at most the last 1 MiB after ordinary appends and caches the last parsed state. If that window has no event, a full streaming scan is reserved for startup, file replacement/truncation, or an unseen burst of at least 1 MiB. Unchanged files use the cache. Recovery takes time proportional to file size without buffering the whole file.
 - Notification text reaches AppleScript as an argument, never interpolated code.
 - No game titles, account data, log contents, or telemetry are sent anywhere.
 

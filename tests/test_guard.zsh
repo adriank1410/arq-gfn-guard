@@ -715,4 +715,60 @@ assert_file_exists "$TEST_ROOT/state/guard-paused"
 run_guard 0 41010
 assert_file_missing "$TEST_ROOT/state/guard-paused"
 
+# Relocating a console must not turn unrelated text into legacy events.
+console_event Streaming > "$TEST_ROOT/gfn.log"
+print '2026-09-09 23:00:10.000 INFO  OtherService streaming terminated' >> "$TEST_ROOT/gfn.log"
+run_guard 1 42000
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+console_event Done >> "$TEST_ROOT/gfn.log"
+print '2026-09-09 23:00:11.000 INFO  OtherService streaming started' >> "$TEST_ROOT/gfn.log"
+run_guard 1 42010
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
+# Instrument the external awk invocation, but execute the real parser. An old
+# event outside the tail needs one recovery scan, not one scan per append.
+awk_probe="$TEST_ROOT/awk-probe"
+cat > "$awk_probe" <<'AWK_PROBE'
+#!/bin/zsh
+if [[ "${@[-1]}" == "$ARQ_AWK_SOURCE" ]]; then
+  print full >> "$ARQ_AWK_LOG"
+fi
+exec /usr/bin/awk "$@"
+AWK_PROBE
+chmod +x "$awk_probe"
+cache_guard="$TEST_ROOT/cache-guard.zsh"
+sed "s#/usr/bin/awk#$awk_probe#g" "$GUARD_SCRIPT" > "$cache_guard"
+chmod +x "$cache_guard"
+console_event Streaming > "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+: > "$TEST_ROOT/guard.log"
+: > "$TEST_ROOT/awk.calls"
+export ARQ_AWK_SOURCE="$TEST_ROOT/gfn.log" ARQ_AWK_LOG="$TEST_ROOT/awk.calls"
+start_monitor 1 "$cache_guard"
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+for append_number in 1 2 3; do
+  print "unrelated append $append_number" >> "$TEST_ROOT/gfn.log"
+  /bin/sleep 1.5
+  kill -0 "$monitor_pid"
+done
+[[ "$(wc -l < "$TEST_ROOT/awk.calls" | tr -d ' ')" == 1 ]] || {
+  print -u2 -- "Repeated full scans after ordinary log appends"
+  exit 1
+}
+# A large unseen burst may contain an end outside the tail: recover it.
+# Stop only this disposable test process while constructing that burst.
+kill -STOP "$monitor_pid"
+console_event Done >> "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+kill -CONT "$monitor_pid"
+wait_for_log "GFN stream inactive; Arq resumed"
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+[[ "$(wc -l < "$TEST_ROOT/awk.calls" | tr -d ' ')" == 2 ]]
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+unset ARQ_AWK_SOURCE ARQ_AWK_LOG
+
 print -r -- "All Arq GFN guard tests passed"
