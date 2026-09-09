@@ -603,4 +603,116 @@ wait_for_calls 'pauseBackups 10'
 assert_file_missing "$recovery_root/state/guard-paused"
 grep -Fq 'failed with exit code 42' "$recovery_root/stderr"
 
+# GFN 2.0.88 no longer forwards streaming events to the reliability monitor.
+# These sanitized lifecycle lines were observed in console.log on both 2.0.87
+# and 2.0.88. Unrelated messages must not be mistaken for a stream transition.
+console_event() {
+  print -r -- "2026-09-09 23:00:08.062 INFO  gfn/StreamerManagerService  Advancing to state: $1 "
+}
+: > "$TEST_ROOT/guard.log"
+console_event Loading > "$TEST_ROOT/gfn.log"
+run_guard 1 20000
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+assert_log_contains "DRY-RUN arqc pauseBackups 10"
+console_event Streaming >> "$TEST_ROOT/gfn.log"
+run_guard 1 20240
+[[ "$(<"$TEST_ROOT/state/guard-paused")" == "20240" ]]
+for end_state in PostSessionConnection PostStreaming Done; do
+  console_event "$end_state" >> "$TEST_ROOT/gfn.log"
+  run_guard 1 20250
+  assert_file_missing "$TEST_ROOT/state/guard-paused"
+  console_event Loading >> "$TEST_ROOT/gfn.log"
+  run_guard 1 20260
+  assert_file_exists "$TEST_ROOT/state/guard-paused"
+done
+console_event Done >> "$TEST_ROOT/gfn.log"
+run_guard 1 20270
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+print '2026-09-09 23:00:09.000 INFO  OtherService  Advancing to state: Streaming' >> "$TEST_ROOT/gfn.log"
+console_event StreamingFailure >> "$TEST_ROOT/gfn.log"
+run_guard 1 20280
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
+# Default path regression: stale reliability log + active modern console.
+# HOME is isolated so this test cannot read the real session or invoke Arq.
+modern_home="$TEST_ROOT/modern-home"
+modern_dir="$modern_home/Library/Application Support/NVIDIA/GeForceNOW"
+mkdir -p "$modern_dir/logs"
+print IPC_STREAMING_MODE_EXIT_EVENT > "$modern_dir/logs/gfn_reliability_monitor.log"
+console_event Streaming > "$modern_dir/console.log"
+HOME="$modern_home" ARQ_GFN_GUARD_DRY_RUN=1 ARQ_GFN_FORCE_PROCESS=1 \
+ARQ_GFN_GUARD_ONCE=1 "$GUARD_SCRIPT"
+assert_file_exists "$modern_home/Library/Application Support/ArqGFNGuard/guard-paused"
+console_event Done >> "$modern_dir/console.log"
+HOME="$modern_home" ARQ_GFN_GUARD_DRY_RUN=1 ARQ_GFN_FORCE_PROCESS=1 \
+ARQ_GFN_GUARD_ONCE=1 "$GUARD_SCRIPT"
+assert_file_missing "$modern_home/Library/Application Support/ArqGFNGuard/guard-paused"
+# Generic legacy phrases from other console modules are not session events.
+print '2026-09-09 23:00:09.000 INFO  OtherService streaming started' >> "$modern_dir/console.log"
+HOME="$modern_home" ARQ_GFN_GUARD_DRY_RUN=1 ARQ_GFN_FORCE_PROCESS=1 \
+ARQ_GFN_GUARD_ONCE=1 "$GUARD_SCRIPT"
+assert_file_missing "$modern_home/Library/Application Support/ArqGFNGuard/guard-paused"
+console_event Streaming >> "$modern_dir/console.log"
+print '2026-09-09 23:00:10.000 INFO  OtherService streaming terminated' >> "$modern_dir/console.log"
+HOME="$modern_home" ARQ_GFN_GUARD_DRY_RUN=1 ARQ_GFN_FORCE_PROCESS=1 \
+ARQ_GFN_GUARD_ONCE=1 "$GUARD_SCRIPT"
+assert_file_exists "$modern_home/Library/Application Support/ArqGFNGuard/guard-paused"
+
+# Same long-running process reacts to console events, including rotation with
+# unchanged size/mtime. Exercise both native and fallback stat implementations.
+for rotation_guard in "$GUARD_SCRIPT" "$fallback_guard"; do
+  : > "$TEST_ROOT/guard.log"
+  printf '%-180s\n' "$(console_event Done)" > "$TEST_ROOT/gfn.log"
+  start_monitor 100 "$rotation_guard"
+  /bin/sleep 1.2
+  for console_state in Loading Done; do
+    printf '%-180s\n' "$(console_event "$console_state")" > "$TEST_ROOT/replacement.log"
+    /usr/bin/touch -r "$TEST_ROOT/gfn.log" "$TEST_ROOT/replacement.log"
+    mv -f "$TEST_ROOT/replacement.log" "$TEST_ROOT/gfn.log"
+    if [[ "$console_state" == Loading ]]; then
+      wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+    else
+      wait_for_log "GFN stream inactive; Arq resumed"
+    fi
+  done
+  kill "$monitor_pid"
+  wait "$monitor_pid" 2>/dev/null || true
+  monitor_pid=""
+done
+
+# Long console sessions retain ownership beyond the bounded scan, including
+# a missing log during rotation, and still honor the eventual end event.
+console_event Streaming > "$TEST_ROOT/gfn.log"
+run_guard 1 30000
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+run_guard 1 30240
+[[ "$(<"$TEST_ROOT/state/guard-paused")" == "30240" ]]
+rm "$TEST_ROOT/gfn.log"
+run_guard 1 30480
+[[ "$(<"$TEST_ROOT/state/guard-paused")" == "30480" ]]
+console_event Done > "$TEST_ROOT/gfn.log"
+run_guard 1 30490
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
+# If the end event is pushed out of the tail before reconciliation (for
+# example while the Mac sleeps), old ownership must not renew forever.
+console_event Streaming > "$TEST_ROOT/gfn.log"
+run_guard 1 40000
+console_event Done >> "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+run_guard 1 40240
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
+# First install/restart mid-stream must also recover an older start event,
+# even when no existing ownership file can supply the state.
+console_event Streaming > "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+run_guard 1 41000
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+run_guard 0 41010
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
 print -r -- "All Arq GFN guard tests passed"

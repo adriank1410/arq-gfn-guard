@@ -7,7 +7,9 @@ umask 077
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 readonly ARQC="${ARQ_GFN_ARQC:-/Applications/Arq.app/Contents/Resources/arqc}"
-readonly GFN_LOG_FILE="${ARQ_GFN_LOG_FILE:-$HOME/Library/Application Support/NVIDIA/GeForceNOW/logs/gfn_reliability_monitor.log}"
+# GFN 2.0.88 stopped forwarding session events to the reliability monitor.
+# The launcher's state machine is logged here on both 2.0.87 and 2.0.88.
+readonly GFN_LOG_FILE="${ARQ_GFN_LOG_FILE:-$HOME/Library/Application Support/NVIDIA/GeForceNOW/console.log}"
 readonly STATE_DIR="${ARQ_GFN_STATE_DIR:-$HOME/Library/Application Support/ArqGFNGuard}"
 readonly STATE_FILE="$STATE_DIR/guard-paused"
 readonly GUARD_LOG="${ARQ_GFN_GUARD_LOG:-$HOME/Library/Logs/ArqGFNGuard/guard.log}"
@@ -132,18 +134,38 @@ gfn_process_state() {
   esac
 }
 
-latest_stream_state() {
-  [[ -f "$GFN_LOG_FILE" ]] || return 0
-
-  /usr/bin/tail -c "$LOG_SCAN_BYTES" "$GFN_LOG_FILE" 2>/dev/null | /usr/bin/awk '
-    /IPC_STREAMING_(PREPARE|STARTING|SESSION_SETUP|STARTED)_EVENT|streaming started/ {
+parse_stream_state() {
+  /usr/bin/awk -v legacy_log="${ARQ_GFN_LOG_FILE:+1}" '
+    / INFO +gfn\/StreamerManagerService +Advancing to state: (Loading|Streaming)[[:space:]]*$/ {
       stream_state = "active"
     }
-    /IPC_STREAMING_(TERMINATED|MODE_EXIT)_EVENT|streaming terminated|GFN UI exited streaming mode/ {
+    / INFO +gfn\/StreamerManagerService +Advancing to state: (PostSessionConnection|PostStreaming|Done)[[:space:]]*$/ {
+      stream_state = "inactive"
+    }
+    # Retain support for explicitly supplied legacy reliability logs.
+    legacy_log && /IPC_STREAMING_(PREPARE|STARTING|SESSION_SETUP|STARTED)_EVENT|streaming started/ {
+      stream_state = "active"
+    }
+    legacy_log && /IPC_STREAMING_(TERMINATED|MODE_EXIT)_EVENT|streaming terminated|GFN UI exited streaming mode/ {
       stream_state = "inactive"
     }
     END { print stream_state }
-  '
+  ' "$@"
+}
+
+latest_stream_state() {
+  [[ -f "$GFN_LOG_FILE" ]] || return 0
+
+  local detected_state
+  detected_state="$(/usr/bin/tail -c "$LOG_SCAN_BYTES" "$GFN_LOG_FILE" 2>/dev/null | parse_stream_state)"
+  if [[ -n "$detected_state" ]]; then
+    print -r -- "$detected_state"
+  else
+    # A chatty console can push even an unobserved end past the fast scan.
+    # Stream the full current log only in that case; never infer an active
+    # session from ownership while a readable older end event is available.
+    parse_stream_state "$GFN_LOG_FILE" 2>/dev/null
+  fi
 }
 
 log_signature() {
@@ -244,8 +266,8 @@ reconcile_backup_state() {
     if [[ "$detected_stream_state" == "active" ]]; then
       current_stream_state="active"
     elif [[ -f "$STATE_FILE" && "$detected_stream_state" != "inactive" ]]; then
-      # If an exceptionally long session pushes its start marker outside the
-      # bounded log window, the private state file keeps the lease alive.
+      # If rotation/removal temporarily hides the session markers, the
+      # private state file keeps the lease alive until evidence returns.
       current_stream_state="active"
     fi
   elif [[ "$process_state" == "unknown" ]]; then

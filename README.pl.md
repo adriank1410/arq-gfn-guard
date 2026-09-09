@@ -12,7 +12,7 @@ Wstrzymywanie Arq zawsze, gdy aplikacja GeForce NOW jest otwarta, byłoby zbyt s
 
 ## Co robi
 
-1. **Wykrywa prawdziwe sesje streamingu** — obserwuje lokalny log niezawodności NVIDIA pod kątem przygotowania, startu, zakończenia i wyjścia z trybu streamingu.
+1. **Wykrywa prawdziwe sesje streamingu** — obserwuje stany sesji w lokalnym `console.log` GFN: `Loading` / `Streaming` wstrzymują backup, a `PostSessionConnection` / `PostStreaming` / `Done` go wznawiają.
 2. **Wstrzymuje backup przed startem streamu** — wywołuje oficjalne polecenie Arq `arqc pauseBackups` już po wykryciu przygotowania sesji.
 3. **Bezpiecznie podtrzymuje pauzę** — ustawia dziesięciominutową pauzę i odnawia ją co cztery minuty podczas streamingu.
 4. **Wznawia backup po wyjściu z gry** — wywołuje `arqc resumeBackups` w ciągu kilku sekund, nawet jeśli launcher GeForce NOW nadal jest otwarty.
@@ -35,7 +35,7 @@ Powiadomienia można włączyć przy instalacji przez `ARQ_GFN_NOTIFICATIONS=1`.
 
 **Dlaczego log GFN zamiast sprawdzania, czy aplikacja jest otwarta?**
 
-Log pokazuje faktyczny cykl streamingu. Launcher może dzięki temu pozostać otwarty bez ciągłego blokowania Arq.
+Log pokazuje faktyczny cykl streamingu. Launcher może dzięki temu pozostać otwarty bez ciągłego blokowania Arq. Źródłem jest `~/Library/Application Support/NVIDIA/GeForceNOW/console.log`, zweryfikowany w GFN 2.0.87 i 2.0.88. Wersja 2.0.88 przestała przekazywać zdarzenia streamingu do `logs/gfn_reliability_monitor.log`, mimo że stary log nadal otrzymuje wpisy aktualizatora. Guard obserwuje więc bezpośrednio stany launchera. Przy bezpośrednim uruchomieniu skryptu można nadal wskazać starszy log przez `ARQ_GFN_LOG_FILE`.
 
 **Dlaczego stałe sprawdzanie co dwie sekundy zamiast `launchd` `WatchPaths`?**
 
@@ -142,7 +142,7 @@ Uruchom w `zsh` z katalogu repo. Przykład symuluje start sesji na plikach tymcz
 (
   test_root=$(mktemp -d /tmp/arq-gfn-preview.XXXXXX) || exit 1
   trap 'rm -rf "$test_root"' EXIT
-  printf '%s\n' IPC_STREAMING_STARTED_EVENT > "$test_root/gfn.log"
+  printf '%s\n' '2026-09-09 23:00:08.062 INFO  gfn/StreamerManagerService  Advancing to state: Streaming' > "$test_root/gfn.log"
   ARQ_GFN_GUARD_DRY_RUN=1 ARQ_GFN_GUARD_ONCE=1 \
     ARQ_GFN_FORCE_PROCESS=1 ARQ_GFN_NOTIFICATIONS=0 \
     ARQ_GFN_LOG_FILE="$test_root/gfn.log" \
@@ -163,7 +163,7 @@ Uruchom w `zsh` z katalogu repo. Przykład symuluje start sesji na plikach tymcz
 
 - Stały systemowy `PATH` i absolutne ścieżki poleceń istotnych dla bezpieczeństwa.
 - Prywatny stan i logi: katalogi `700`, pliki `600`.
-- Atomowy zapis stanu, ograniczony odczyt jednego megabajta logu i automatyczna rotacja.
+- Atomowy zapis stanu i automatyczna rotacja logu guarda. Detekcja zwykle czyta ostatni 1 MiB; jeśli nie znajdzie zdarzenia sesji, skanuje bieżący log od początku, aby odzyskać starszy początek lub koniec. Ten odczyt jest strumieniowy (bez buforowania całego pliku), a jego czas rośnie proporcjonalnie do rozmiaru pliku.
 - Tekst powiadomienia trafia do AppleScript jako argument, a nie fragment kodu.
 - Tytuły gier, dane konta, treść logu ani telemetria nie są nigdzie wysyłane.
 

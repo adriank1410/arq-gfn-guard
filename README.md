@@ -12,7 +12,7 @@ Pausing Arq whenever the GeForce NOW app is open is too broad because its launch
 
 ## What it does
 
-1. **Detects real streaming sessions** — watches NVIDIA's local reliability log for session preparation, start, termination, and streaming-mode exit events.
+1. **Detects real streaming sessions** — watches GFN's local `console.log` for the session state machine: `Loading` / `Streaming` pause backups; `PostSessionConnection` / `PostStreaming` / `Done` resume them.
 2. **Pauses before streaming starts** — calls Arq's official `arqc pauseBackups` command as soon as session preparation appears.
 3. **Keeps the pause alive safely** — uses a 10-minute lease renewed every 4 minutes while streaming remains active.
 4. **Resumes after the game exits** — calls `arqc resumeBackups` within a few seconds, even when the GeForce NOW launcher stays open.
@@ -35,7 +35,7 @@ Enable notifications during installation with `ARQ_GFN_NOTIFICATIONS=1`. Their l
 
 **Why inspect the GFN log instead of checking whether the app is open?**
 
-The log exposes the actual streaming lifecycle. This lets the launcher remain open without keeping Arq paused.
+The log exposes the actual streaming lifecycle. This lets the launcher remain open without keeping Arq paused. The source is `~/Library/Application Support/NVIDIA/GeForceNOW/console.log`, verified with GFN 2.0.87 and 2.0.88. Version 2.0.88 stopped forwarding streaming events to `logs/gfn_reliability_monitor.log`, even though that old log still receives updater messages. The guard therefore watches the launcher state machine directly. Explicitly supplied legacy log fixtures remain supported through `ARQ_GFN_LOG_FILE` when running the script directly.
 
 **Why a persistent two-second check instead of `launchd` `WatchPaths`?**
 
@@ -142,7 +142,7 @@ Run from the repository in `zsh`. This simulates a session start in temporary fi
 (
   test_root=$(mktemp -d /tmp/arq-gfn-preview.XXXXXX) || exit 1
   trap 'rm -rf "$test_root"' EXIT
-  printf '%s\n' IPC_STREAMING_STARTED_EVENT > "$test_root/gfn.log"
+  printf '%s\n' '2026-09-09 23:00:08.062 INFO  gfn/StreamerManagerService  Advancing to state: Streaming' > "$test_root/gfn.log"
   ARQ_GFN_GUARD_DRY_RUN=1 ARQ_GFN_GUARD_ONCE=1 \
     ARQ_GFN_FORCE_PROCESS=1 ARQ_GFN_NOTIFICATIONS=0 \
     ARQ_GFN_LOG_FILE="$test_root/gfn.log" \
@@ -163,7 +163,7 @@ Run from the repository in `zsh`. This simulates a session start in temporary fi
 
 - Fixed system-only `PATH` and absolute paths for security-sensitive commands.
 - Private state and logs (`700` directories and `600` files).
-- Atomic state writes, bounded one-megabyte log reads, and automatic log rotation.
+- Atomic state writes and automatic guard-log rotation. Detection normally reads the last 1 MiB; if no session event is found, it scans the current log from the beginning to recover an older start or end. This fallback uses streaming input (no whole-file buffer), with time proportional to the file size.
 - Notification text reaches AppleScript as an argument, never interpolated code.
 - No game titles, account data, log contents, or telemetry are sent anywhere.
 
