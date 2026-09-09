@@ -170,7 +170,7 @@ parsed_size=0
 parsed_stream_state=""
 parsed_prefix=""
 parsed_suffix=""
-current_source_event=0
+source_proof_ready=0
 
 # Compare small byte checkpoints before trusting append-only growth. Reading
 # at the OLD size detects copytruncate/regrowth without scanning the prefix.
@@ -233,7 +233,7 @@ latest_stream_state() {
     recover=1
   fi
 
-  current_source_event=0
+  source_proof_ready=0
   detected_state="$(/usr/bin/tail -c "$LOG_SCAN_BYTES" "$GFN_LOG_FILE" 2>/dev/null | parse_stream_state)" || return 0
   if [[ -z "$detected_state" ]] && (( recover )); then
     # Full scans are for startup, rotation/truncation, and unseen bursts that
@@ -242,11 +242,11 @@ latest_stream_state() {
     detected_state="$(parse_stream_state "$GFN_LOG_FILE" 2>/dev/null)" || return 0
   fi
   if [[ -n "$detected_state" ]]; then
-    current_source_event=1
+    source_proof_ready=1
   elif (( ! recover )); then
     detected_state="$parsed_stream_state"
   fi
-  if [[ -z "$detected_state" ]] && (( replacement && parsed_size > 0 )); then
+  if [[ -z "$detected_state" ]] && (( replacement )); then
     # A last end event may have moved to .bak before we saw it. Only trust
     # the prior source inode, or a copy matching its recorded checkpoints;
     # an unrelated backup from an older session must never resume Arq.
@@ -257,11 +257,14 @@ latest_stream_state() {
       backup_identity="${backup_identity%:*}"
       local backup_size="${log_signature_out##*:}"
       if [[ "$backup_identity" == "$parsed_identity" ]] \
-          || { (( backup_size >= parsed_size )) \
+          || { (( parsed_size > 0 && backup_size >= parsed_size )) \
                && log_checkpoint "$parsed_size" "$backup_file" \
                && [[ "$checkpoint_prefix_out" == "$parsed_prefix" \
                   && "$checkpoint_suffix_out" == "$parsed_suffix" ]]; }; then
         detected_state="$(parse_stream_state "$backup_file" 2>/dev/null)" || detected_state=""
+        # The trusted old source proves this new file continues the lease.
+        # Persist its identity too, so successive rotations remain recoverable.
+        [[ -z "$detected_state" ]] || source_proof_ready=1
       fi
     fi
   fi
@@ -314,7 +317,7 @@ read_state_timestamp() {
 restore_source_checkpoint() {
   [[ "$has_system" == true && -f "$STATE_FILE" ]] || return 1
   local proof_fd saved_epoch proof_version proof_identity proof_size extra
-  local prefix_data suffix_data chunk_size bytes_read
+  local prefix_data="" suffix_data="" chunk_size bytes_read
   { exec {proof_fd}< "$STATE_FILE"; } 2>/dev/null || return 1
   {
     IFS= read -r -u "$proof_fd" saved_epoch || return 1
@@ -323,12 +326,13 @@ restore_source_checkpoint() {
        && "$proof_version" == source-v1 && -z "$extra" \
        && "$proof_identity" =~ ^[0-9]{1,18}:[0-9]{1,18}$ \
        && "$proof_size" =~ ^[0-9]+$ && ${#proof_size} -le 18 ]] || return 1
-    (( proof_size > 0 )) || return 1
     chunk_size=$(( proof_size < CHECKPOINT_BYTES ? proof_size : CHECKPOINT_BYTES ))
-    sysread -i "$proof_fd" -s "$chunk_size" -c bytes_read prefix_data || return 1
-    (( bytes_read == chunk_size )) || return 1
-    sysread -i "$proof_fd" -s "$chunk_size" -c bytes_read suffix_data || return 1
-    (( bytes_read == chunk_size )) || return 1
+    if (( chunk_size > 0 )); then
+      sysread -i "$proof_fd" -s "$chunk_size" -c bytes_read prefix_data || return 1
+      (( bytes_read == chunk_size )) || return 1
+      sysread -i "$proof_fd" -s "$chunk_size" -c bytes_read suffix_data || return 1
+      (( bytes_read == chunk_size )) || return 1
+    fi
     parsed_identity="$proof_identity"
     parsed_size="$proof_size"
     parsed_prefix="$prefix_data"
@@ -352,7 +356,7 @@ write_state_timestamp() {
   }
   if ! {
     print -r -- "$epoch_value" && {
-      if (( current_source_event && parsed_size > 0 )) && [[ -n "$parsed_signature" ]]; then
+      if (( source_proof_ready )) && [[ -n "$parsed_signature" ]]; then
         print -r -- "source-v1 $parsed_identity $parsed_size" \
           && print -rn -- "$parsed_prefix$parsed_suffix"
       elif [[ -f "$STATE_FILE" ]]; then
@@ -438,7 +442,7 @@ reconcile_backup_state() {
     parsed_stream_state=""
     parsed_prefix=""
     parsed_suffix=""
-    current_source_event=0
+    source_proof_ready=0
   fi
 
   if [[ "$current_stream_state" == "active" ]]; then

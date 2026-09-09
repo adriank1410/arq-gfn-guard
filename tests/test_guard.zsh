@@ -924,4 +924,21 @@ kill "$monitor_pid"
 wait "$monitor_pid" 2>/dev/null || true
 monitor_pid=""
 
+# Renewing from a trusted rotated start must persist the new source identity,
+# so another rotation plus restart can still recover its end transition.
+for new_source_mode in header empty; do
+  console_event Streaming > "$TEST_ROOT/gfn.log"
+  run_guard 1 60000
+  mv -f "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+  : > "$TEST_ROOT/gfn.log"
+  [[ "$new_source_mode" == empty ]] || print 'new console header' > "$TEST_ROOT/gfn.log"
+  run_guard 1 60250
+  assert_file_exists "$TEST_ROOT/state/guard-paused"
+  console_event Done >> "$TEST_ROOT/gfn.log"
+  mv -f "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+  print 'third console generation' > "$TEST_ROOT/gfn.log"
+  run_guard 1 60500
+  assert_file_missing "$TEST_ROOT/state/guard-paused"
+done
+
 print -r -- "All Arq GFN guard tests passed"
