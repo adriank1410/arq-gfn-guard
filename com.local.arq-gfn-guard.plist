@@ -20,6 +20,8 @@
   <dict>
     <key>ARQ_GFN_NOTIFICATIONS</key>
     <string>0</string>
+    <key>ARQ_GFN_ERROR_NOTIFICATIONS</key>
+    <string>1</string>
     <key>ARQ_GFN_LANG</key>
     <string></string>
     <key>ARQ_GFN_LOOP_SECONDS</key>

@@ -2,6 +2,9 @@
 
 set -eu
 unsetopt bg_nice
+# Failure fixtures must not send desktop alerts. The separate source suite
+# verifies default-on error notifications through a fake external boundary.
+export ARQ_GFN_ERROR_NOTIFICATIONS=0
 
 readonly TEST_DIR="${0:A:h}"
 readonly SCRIPT_DIR="${TEST_DIR:h}"
@@ -89,6 +92,10 @@ fi
   print -u2 -- "Notifications must be disabled by default in the LaunchAgent"
   exit 1
 }
+[[ "$(/usr/bin/plutil -extract EnvironmentVariables.ARQ_GFN_ERROR_NOTIFICATIONS raw -o - "$GUARD_PLIST")" == "1" ]] || {
+  print -u2 -- "Error notifications must be enabled by default"
+  exit 1
+}
 [[ "$(/usr/bin/plutil -extract EnvironmentVariables.ARQ_GFN_LOOP_SECONDS raw -o - "$GUARD_PLIST")" == "2" ]] || {
   print -u2 -- "LaunchAgent must expose the two-second loop default"
   exit 1
@@ -120,7 +127,7 @@ done
   print -u2 -- "English README must document silent-by-default behavior"
   exit 1
 }
-/usr/bin/grep -Fq -- 'Domyślnie działa **bez powiadomień**' "$SCRIPT_DIR/README.pl.md" || {
+/usr/bin/grep -Fq -- 'Domyślnie działa **bez powiadomień o początku i końcu sesji**' "$SCRIPT_DIR/README.pl.md" || {
   print -u2 -- "Polish README must document silent-by-default behavior"
   exit 1
 }

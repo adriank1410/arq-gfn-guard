@@ -12,14 +12,14 @@ Wstrzymywanie Arq zawsze, gdy aplikacja GeForce NOW jest otwarta, byłoby zbyt s
 
 ## Co robi
 
-1. **Wykrywa prawdziwe sesje streamingu** — obserwuje stany sesji w lokalnym `console.log` GFN: `Loading` / `Streaming` wstrzymują backup, a `PostSessionConnection` / `PostStreaming` / `Done` go wznawiają.
+1. **Wykrywa prawdziwe sesje streamingu** — czyta zdarzenia IPC z mniejszego `debug.log` GFN, z `console.log` jako alternatywą. Nowsze zdarzenia sesji mają pierwszeństwo przed starymi wpisami w drugim pliku.
 2. **Wstrzymuje backup przed startem streamu** — wywołuje oficjalne polecenie Arq `arqc pauseBackups` już po wykryciu przygotowania sesji.
 3. **Bezpiecznie podtrzymuje pauzę** — ustawia dziesięciominutową pauzę i odnawia ją co cztery minuty podczas streamingu.
 4. **Wznawia backup po wyjściu z gry** — wywołuje `arqc resumeBackups` w ciągu kilku sekund, nawet jeśli launcher GeForce NOW nadal jest otwarty.
 5. **Działa bezpiecznie przy błędach** — problem z odczytem procesu nie może fałszywie wznowić Arq; pominięte zdarzenie jest uzgadniane w ciągu 60 sekund; po wyłączeniu guarda pozostaje tylko automatycznie wygasająca pauza.
 6. **Śledzi własne udane pauzy** — wznawia backup tylko wtedy, gdy prywatny stan potwierdza, że guard skutecznie wywołał pauzę. Arq udostępnia jedną globalną pauzę, dlatego łączenie sesji GFN z niezależną ręczną pauzą Arq nie jest obsługiwane i może zakończyć się jej zastąpieniem albo wznowieniem.
 7. **Działa cicho i lokalnie** — bez roota, bez połączeń sieciowych, z użyciem około 2 MB RAM i praktycznie 0% CPU w spoczynku na referencyjnym Macu Intel.
-8. **Udostępnia opcjonalne powiadomienia macOS** — domyślnie wyłączone, automatycznie po polsku lub angielsku i bez powtarzania komunikatu przy odnawianiu pauzy.
+8. **Zgłasza problemy powiadomieniami macOS** — alerty o błędach są domyślnie włączone; zwykłe powiadomienia początku i końca sesji pozostają wyłączone. Oba rodzaje obsługują język polski i angielski.
 
 ### Powiadomienia
 
@@ -31,15 +31,17 @@ Wstrzymywanie Arq zawsze, gdy aplikacja GeForce NOW jest otwarta, byłoby zbyt s
 
 Powiadomienia można włączyć przy instalacji przez `ARQ_GFN_NOTIFICATIONS=1`. Ich język jest zgodny z macOS; `ARQ_GFN_LANG=pl` albo `ARQ_GFN_LANG=en` wymusza konkretny wariant.
 
+Alerty błędów są niezależne od zwykłych powiadomień. Brak źródeł lub nierozpoznany stan zgłaszany jest po co najmniej 60 sekundach, przy najbliższym uzgodnieniu (domyślnie zwykle do około 120 sekund od wykrycia problemu). Błędy poleceń Arq i zapisu stanu zgłaszane są od razu po nieudanej operacji. Jeden trwający błąd nie powtarza powiadomienia po każdym sprawdzeniu ani restarcie; powrót do poprawnej pracy pozwala zgłosić jego ponowne wystąpienie. Dostarczenie powiadomień zależy od ustawień macOS i trybu skupienia. Brak użytecznych logów przy działającym GFN oznacza „nie można ustalić stanu sesji”, a nie dowód, że trwa gra. Błąd polecenia Arq oznacza, że guard nie uzyskał potwierdzenia jego wykonania. Sam otwarty launcher ze znanym stanem zakończenia nie wymaga pauzy. Żaden parser nie odtworzy pewnie zdarzeń usuniętych ze wszystkich źródeł; alert ma ujawnić taką utratę detekcji. Nie usuwaj katalogu stanu guarda w `~/Library/Application Support/ArqGFNGuard/` podczas jego działania.
+
 ## Decyzje projektowe
 
 **Dlaczego log GFN zamiast sprawdzania, czy aplikacja jest otwarta?**
 
-Log pokazuje faktyczny cykl streamingu. Launcher może dzięki temu pozostać otwarty bez ciągłego blokowania Arq. Źródłem jest `~/Library/Application Support/NVIDIA/GeForceNOW/console.log`, zweryfikowany w GFN 2.0.87 i 2.0.88. Wersja 2.0.88 przestała przekazywać zdarzenia streamingu do `logs/gfn_reliability_monitor.log`, mimo że stary log nadal otrzymuje wpisy aktualizatora. Guard obserwuje więc bezpośrednio stany launchera. Przy bezpośrednim uruchomieniu skryptu można nadal wskazać starszy log przez `ARQ_GFN_LOG_FILE`.
+Zdarzenia sesji pochodzą z `debug.log` oraz `console.log` w `~/Library/Application Support/NVIDIA/GeForceNOW/`, zweryfikowanych lokalnie w GFN 2.0.87 i 2.0.88. Mniejszy `debug.log` zawiera `IPC_STREAMING_PREPARE/STARTING/SESSION_SETUP/STARTED_EVENT` oraz `IPC_STREAMING_TERMINATED/MODE_EXIT_EVENT`. Alternatywny `console.log` zawiera stany `Loading` / `Streaming` oraz `PostSessionConnection` / `PostStreaming` / `Done`. Wybór uwzględnia czas zdarzenia, aby stary wpis w jednym pliku nie przesłonił nowej sesji w drugim. W lokalnej wersji 2.0.88 stare `logs/gfn_reliability_monitor.log` i `logs/gameStreamClientAgent.log` nie zawierały nowej sesji, dlatego nie są automatycznymi alternatywami. `ARQ_GFN_LOG_FILE` przy bezpośrednim uruchomieniu ogranicza odczyt do jawnie wskazanego pliku; starszy format pozostaje obsługiwany.
 
 **Dlaczego stałe sprawdzanie co dwie sekundy zamiast `launchd` `WatchPaths`?**
 
-Wcześniejszy wariant `WatchPaths` wyglądał lepiej na papierze, ale macOS scalał lub opóźniał zdarzenia na tyle, że zarówno pauza, jak i wznowienie następowały zbyt późno. Obecna szybka ścieżka spoczynkowa nie analizuje logu ani nie wywołuje `pgrep`: wykonuje wyłącznie działające wewnątrz procesu sprawdzenie sygnatury przez `zsh/stat`, a następnie zasypia przez `zselect`. `tail`, `awk`, sprawdzenie procesu i odczyt zegara uruchamiają się dopiero po zmianie logu albo podczas kontrolnego uzgodnienia co 60 sekund.
+Wcześniejszy wariant `WatchPaths` wyglądał lepiej na papierze, ale macOS scalał lub opóźniał zdarzenia na tyle, że zarówno pauza, jak i wznowienie następowały zbyt późno. Obecna szybka ścieżka spoczynkowa nie analizuje logu ani nie wywołuje `pgrep`: sprawdza sygnatury obu plików przez `zsh/stat` oraz małe fragmenty kontrolne przez `zsh/system`, a następnie zasypia przez `zselect`. `tail`, `awk`, sprawdzenie procesu i odczyt zegara uruchamiają się dopiero po zmianie logu albo podczas kontrolnego uzgodnienia co 60 sekund.
 
 `fswatch` wymagałby Homebrew. Natywny helper Swift/kqueue usunąłby timer, ale oznaczałby dystrybucję i utrzymywanie pliku binarnego o większym zużyciu pamięci. Interwał dwóch sekund pozostaje konfigurowalny.
 
@@ -61,7 +63,7 @@ cd arq-gfn-guard
 ./install.sh
 ```
 
-Domyślnie działa **bez powiadomień**. Można je włączyć przez:
+Domyślnie działa **bez powiadomień o początku i końcu sesji**, ale z alertami o błędach. Zwykłe powiadomienia można włączyć przez:
 
 ```bash
 ARQ_GFN_NOTIFICATIONS=1 ./install.sh
@@ -103,7 +105,8 @@ Przekaż nadpisanie do `./install.sh`; instalator je sprawdzi i zapisze w wygene
 
 | Zmienna | Domyślnie | Znaczenie |
 |---|---:|---|
-| `ARQ_GFN_NOTIFICATIONS` | `0` | `1` włącza jeden komunikat początku i końca sesji; `0` oznacza tryb cichy |
+| `ARQ_GFN_NOTIFICATIONS` | `0` | `1` włącza jeden komunikat początku i końca sesji; `0` wyłącza zwykłe komunikaty sesji |
+| `ARQ_GFN_ERROR_NOTIFICATIONS` | `1` | Ostrzega o błędach detekcji i poleceń Arq; `0` wyłącza te alerty |
 | `ARQ_GFN_LANG` | puste | `en`, `pl` albo puste dla autodetekcji języka macOS |
 | `ARQ_GFN_LOOP_SECONDS` | `2` | Interwał lekkiego sprawdzania sygnatury logu |
 | `ARQ_GFN_SAFETY_SECONDS` | `60` | Interwał pełnego kontrolnego uzgodnienia stanu |
@@ -120,7 +123,7 @@ ARQ_GFN_LOOP_SECONDS=5 ./install.sh
 |---|---|
 | `arq-gfn-guard.sh` | `~/Library/Application Support/ArqGFNGuard/arq-gfn-guard.sh` |
 | `com.local.arq-gfn-guard.plist` | `~/Library/LaunchAgents/com.local.arq-gfn-guard.plist` *(generowany przez instalator)* |
-| *(tworzony podczas działania)* | `~/Library/Application Support/ArqGFNGuard/guard-paused` |
+| *(tworzony podczas działania)* | `~/Library/Application Support/ArqGFNGuard/guard-paused` oraz `guard-alert` |
 | *(tworzony podczas działania)* | `~/Library/Logs/ArqGFNGuard/guard.log` |
 | *(wyjście launchd)* | `~/Library/Logs/ArqGFNGuard/launchd.out.log` oraz `launchd.err.log` |
 
@@ -131,6 +134,7 @@ Testy używają odizolowanych logów i stanu oraz atrap `arqc`, zegara, odczytu 
 ```bash
 zsh -n arq-gfn-guard.sh install.sh uninstall.sh tests/test_guard.zsh
 zsh tests/test_guard.zsh
+zsh tests/test_sources.zsh
 plutil -lint com.local.arq-gfn-guard.plist
 ```
 

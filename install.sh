@@ -28,6 +28,12 @@ else
   notification_language="$(/usr/bin/plutil -extract EnvironmentVariables.ARQ_GFN_LANG raw -o - "$DEST_PLIST" 2>/dev/null)" \
     || notification_language=""
 fi
+if (( ${+ARQ_GFN_ERROR_NOTIFICATIONS} )); then
+  error_notifications_value="$ARQ_GFN_ERROR_NOTIFICATIONS"
+else
+  error_notifications_value="$(/usr/bin/plutil -extract EnvironmentVariables.ARQ_GFN_ERROR_NOTIFICATIONS raw -o - "$DEST_PLIST" 2>/dev/null)" \
+    || error_notifications_value="1"
+fi
 if (( ${+ARQ_GFN_LOOP_SECONDS} )); then
   loop_seconds="$ARQ_GFN_LOOP_SECONDS"
 else
@@ -63,6 +69,11 @@ fi
 if [[ "$notifications_value" != "0" && "$notifications_value" != "1" ]]; then
   msg "ARQ_GFN_NOTIFICATIONS must be 0 or 1." \
       "ARQ_GFN_NOTIFICATIONS musi mieć wartość 0 albo 1."
+  exit 2
+fi
+if [[ "$error_notifications_value" != "0" && "$error_notifications_value" != "1" ]]; then
+  msg "ARQ_GFN_ERROR_NOTIFICATIONS must be 0 or 1." \
+      "ARQ_GFN_ERROR_NOTIFICATIONS musi mieć wartość 0 albo 1."
   exit 2
 fi
 if [[ -n "$notification_language" \
@@ -104,6 +115,7 @@ fi
 /usr/bin/plutil -replace StandardOutPath -string "$STDOUT_LOG" "$DEST_PLIST"
 /usr/bin/plutil -replace StandardErrorPath -string "$STDERR_LOG" "$DEST_PLIST"
 /usr/bin/plutil -replace EnvironmentVariables.ARQ_GFN_NOTIFICATIONS -string "$notifications_value" "$DEST_PLIST"
+/usr/bin/plutil -replace EnvironmentVariables.ARQ_GFN_ERROR_NOTIFICATIONS -string "$error_notifications_value" "$DEST_PLIST"
 /usr/bin/plutil -replace EnvironmentVariables.ARQ_GFN_LANG -string "$notification_language" "$DEST_PLIST"
 /usr/bin/plutil -replace EnvironmentVariables.ARQ_GFN_LOOP_SECONDS -string "$loop_seconds" "$DEST_PLIST"
 /usr/bin/plutil -replace EnvironmentVariables.ARQ_GFN_SAFETY_SECONDS -string "$safety_seconds" "$DEST_PLIST"
@@ -139,7 +151,9 @@ if [[ "$notifications_value" == "1" ]]; then
   msg "Notifications: enabled (${notification_language:-auto})." \
       "Powiadomienia: włączone (${notification_language:-auto})."
 else
-  msg "Notifications: disabled (silent mode)." \
-      "Powiadomienia: wyłączone (tryb cichy)."
+  msg "Session notifications: disabled." \
+      "Powiadomienia o początku i końcu sesji: wyłączone."
 fi
+msg "Error notifications: $error_notifications_value (1=on, 0=off)." \
+    "Powiadomienia o błędach: $error_notifications_value (1=włączone, 0=wyłączone)."
 msg "Log: $LOG_DIR/guard.log" "Log: $LOG_DIR/guard.log"
