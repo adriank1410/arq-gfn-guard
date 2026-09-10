@@ -10,6 +10,7 @@ readonly ARQC="${ARQ_GFN_ARQC:-/Applications/Arq.app/Contents/Resources/arqc}"
 readonly STATE_DIR="${ARQ_GFN_STATE_DIR:-$HOME/Library/Application Support/ArqGFNGuard}"
 readonly STATE_FILE="$STATE_DIR/guard-paused"
 readonly CLOCK_STATE_FILE="$STATE_DIR/guard-clock"
+readonly STOPPED_STATE_FILE="$STATE_DIR/guard-stopped"
 readonly ALERT_STATE_FILE="$STATE_DIR/guard-alert"
 readonly GUARD_LOG="${ARQ_GFN_GUARD_LOG:-$HOME/Library/Logs/ArqGFNGuard/guard.log}"
 readonly PAUSE_MINUTES=10
@@ -499,6 +500,55 @@ owned_clock_revision=-1
 clock_failure_logged=0
 clock_failure_notified=0
 
+restore_stopped_evidence() {
+  [[ -e "$STOPPED_STATE_FILE" || -L "$STOPPED_STATE_FILE" ]] || return 0
+  local saved_debug saved_console extra evidence_fd
+  local invalid=0
+  local evidence_pattern='^(active|inactive)?[|]([0-9]{17})?$'
+  if [[ ! -f "$STOPPED_STATE_FILE" ]]; then
+    invalid=1
+  elif ! { exec {evidence_fd}< "$STOPPED_STATE_FILE"; }; then
+    invalid=1
+  else
+    if ! IFS= read -r -u "$evidence_fd" saved_debug; then invalid=1; fi
+    if (( !invalid )) && ! IFS= read -r -u "$evidence_fd" saved_console; then invalid=1; fi
+    if (( !invalid )) && IFS= read -r -u "$evidence_fd" extra; then invalid=1; fi
+    if (( !invalid )) && [[ ! "$saved_debug" =~ "$evidence_pattern" ]]; then invalid=1; fi
+    if (( !invalid )) && [[ ! "$saved_console" =~ "$evidence_pattern" ]]; then invalid=1; fi
+    exec {evidence_fd}<&-
+  fi
+  if (( invalid )); then
+    log_message "WARN: invalid stopped-session evidence; ignoring it"
+    return 1
+  fi
+  stopped_debug_evidence="$saved_debug"
+  stopped_console_evidence="$saved_console"
+}
+
+write_stopped_evidence() {
+  local temporary_stopped
+  local evidence_pattern='^(active|inactive)?[|]([0-9]{17})?$'
+  [[ "$stopped_debug_evidence" =~ "$evidence_pattern" \
+      && "$stopped_console_evidence" =~ "$evidence_pattern" ]] || return 1
+  temporary_stopped="$(/usr/bin/mktemp "$STATE_DIR/.guard-stopped.XXXXXX")" || return 1
+  if ! {
+    print -r -- "$stopped_debug_evidence"
+    print -r -- "$stopped_console_evidence"
+  } > "$temporary_stopped"; then
+    rm -f "$temporary_stopped"
+    return 1
+  fi
+  chmod 600 "$temporary_stopped" 2>/dev/null || true
+  if ! mv -f "$temporary_stopped" "$STOPPED_STATE_FILE"; then
+    rm -f "$temporary_stopped"
+    return 1
+  fi
+}
+
+clear_stopped_evidence() {
+  rm -f "$STOPPED_STATE_FILE" 2>/dev/null || true
+}
+
 clock_state_failure() {
   if (( ! clock_failure_logged )); then
     log_message "ERROR: could not read or save GFN clock recovery state"
@@ -741,8 +791,7 @@ latest_stream_state() {
   selected_source_untrusted=0
   if [[ "$previous_source_key" != "$source_key" && "$clock_source_key" != "$source_key" ]] \
       && [[ "$previous_source_key" != legacy || "$source_identity" != "$parsed_identity" ]] \
-      && { [[ "$parsed_stream_state" == active && "$detected_state" == inactive ]] \
-        || [[ "$parsed_stream_state" == inactive && "$detected_state" == active ]]; }; then
+      && [[ -n "$parsed_stream_state" && -n "$detected_state" ]]; then
     if [[ -z "$detected_event_time" || -z "$parsed_event_time" || "$parsed_event_time" == - ]] \
         || [[ -n "$parsed_event_time" && "$detected_event_time" < "$parsed_event_time" ]]; then
       detected_state=""
@@ -1285,6 +1334,10 @@ reconcile_backup_state() {
     latest_stream_state "$source_signature"
     detected_stream_state="$detected_stream_state_out"
     [[ -n "$detected_stream_state" ]] && selected_source_has_evidence=1
+    if [[ "$detected_stream_state" == active || "$detected_stream_state" == inactive ]] \
+        && (( ! selected_source_untrusted )); then
+      clear_stopped_evidence
+    fi
     if [[ "$detected_stream_state" == "active" ]]; then
       current_stream_state="active"
     elif [[ -f "$STATE_FILE" && "$detected_stream_state" != "inactive" ]]; then
@@ -1309,6 +1362,10 @@ reconcile_backup_state() {
     latest_stream_state "$source_signature"
     detected_stream_state="$detected_stream_state_out"
     [[ -n "$detected_stream_state" ]] && selected_source_has_evidence=1
+    if [[ "$detected_stream_state" == active || "$detected_stream_state" == inactive ]] \
+        && (( ! selected_source_untrusted )); then
+      clear_stopped_evidence
+    fi
     if [[ "$detected_stream_state" == "active" ]] \
         || [[ -f "$STATE_FILE" && "$detected_stream_state" != "inactive" ]]; then
       current_stream_state="active"
@@ -1342,6 +1399,7 @@ reconcile_backup_state() {
     parsed_prefix=""
     parsed_suffix=""
     source_proof_ready=0
+    write_stopped_evidence || log_message "WARN: could not save stopped-session evidence"
     [[ -f "$STATE_FILE" ]] || clear_alert_episode
   fi
 
@@ -1458,6 +1516,7 @@ guard_sleep() {
 
 restore_source_checkpoint || true
 restore_clock_state || true
+restore_stopped_evidence || true
 restore_alert_episode
 
 last_signature=""

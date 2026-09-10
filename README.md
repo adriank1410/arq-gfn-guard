@@ -125,7 +125,7 @@ ARQ_GFN_LOOP_SECONDS=5 ./install.sh
 |---|---|
 | `arq-gfn-guard.sh` | `~/Library/Application Support/ArqGFNGuard/arq-gfn-guard.sh` |
 | `com.local.arq-gfn-guard.plist` | `~/Library/LaunchAgents/com.local.arq-gfn-guard.plist` *(rendered by the installer)* |
-| *(generated at runtime)* | `~/Library/Application Support/ArqGFNGuard/guard-paused` and `guard-clock`, `guard-alert-detection`, `guard-alert-action` |
+| *(generated at runtime)* | `~/Library/Application Support/ArqGFNGuard/guard-paused`, `guard-clock`, `guard-stopped`, `guard-alert-detection`, `guard-alert-action` |
 | *(generated at runtime)* | `~/Library/Logs/ArqGFNGuard/guard.log` |
 | *(launchd output)* | `~/Library/Logs/ArqGFNGuard/launchd.out.log` and `launchd.err.log` |
 

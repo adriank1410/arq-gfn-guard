@@ -14,7 +14,7 @@ event() {
 
 run_guard() {
   env HOME="$HOME" ARQ_GFN_ARQC="$ARQ_GFN_ARQC" ARQ_GFN_STATE_DIR="$ARQ_GFN_STATE_DIR" \
-    ARQ_GFN_GUARD_LOG="$ARQ_GFN_GUARD_LOG" ARQ_GFN_FORCE_PROCESS=1 \
+    ARQ_GFN_GUARD_LOG="$ARQ_GFN_GUARD_LOG" ARQ_GFN_FORCE_PROCESS="${TEST_PROCESS:-1}" \
     ARQ_GFN_NOW="$1" ARQ_GFN_NOTIFICATIONS=0 ARQ_GFN_ERROR_NOTIFICATIONS=0 \
     ARQ_GFN_GUARD_ONCE=1 "$GUARD"
 }
@@ -59,6 +59,26 @@ event 12:00:00.000 Done "$TEST_LOGS/console.log"
 run_guard 1300
 check test ! -f "$TEST_STATE/guard-paused"
 check grep -q '^resumeBackups$' "$TEST_ACTIONS"
+
+# A stopped process baseline must survive a guard restart and suppress the
+# previous process's unchanged active marker until a new lifecycle event.
+new_fixture post-exit
+event 11:00:00.000 Streaming "$TEST_LOGS/debug.log"
+run_guard 3000
+check test -f "$TEST_STATE/guard-paused"
+TEST_PROCESS=0 run_guard 3010
+check test ! -f "$TEST_STATE/guard-paused"
+check test -f "$TEST_STATE/guard-stopped"
+: > "$TEST_ACTIONS"
+run_guard 3250
+check test ! -f "$TEST_STATE/guard-paused"
+if grep -q '^pauseBackups' "$TEST_ACTIONS"; then
+  print -u2 -- 'FAIL: unchanged pre-exit active marker renewed after restart'; exit 1
+fi
+event 12:00:00.000 Streaming "$TEST_LOGS/debug.log"
+run_guard 3260
+check test -f "$TEST_STATE/guard-paused"
+check test ! -f "$TEST_STATE/guard-stopped"
 
 # Load definitions without starting the production loop so both candidate
 # scans happen in the same selector pass and rollback resolution is observable.
