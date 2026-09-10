@@ -139,6 +139,7 @@ zsh tests/test_guard.zsh
 zsh tests/test_sources.zsh
 zsh tests/test_source_edges.zsh
 zsh tests/test_alert_edges.zsh
+zsh tests/test_snapshot.zsh
 plutil -lint com.local.arq-gfn-guard.plist
 ```
 

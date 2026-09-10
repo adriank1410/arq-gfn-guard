@@ -367,7 +367,9 @@ gfn_process_state() {
 }
 
 parse_stream_evidence() {
-  /usr/bin/awk '
+  local watermark=0
+  if [[ "${1:-}" == --watermark ]]; then watermark=1; shift; fi
+  /usr/bin/awk -v watermark="$watermark" '
     function normalized_timestamp(value) {
       gsub(/[-\/:. ]/, "", value)
       return value
@@ -392,6 +394,7 @@ parse_stream_evidence() {
       # awk floating-point number).
       latest_state = next_state
       latest_time = event_time
+      latest_line = NR
     }
     / INFO +gfn\/StreamerManagerService +Advancing to state: (Loading|Streaming)[[:space:]]*$/ {
       record_state("active", line_timestamp())
@@ -415,7 +418,12 @@ parse_stream_evidence() {
     /gfn_background_agent_ipc[.]cpp[(][0-9]+[)].*Sending .*IPC_STREAMING_(TERMINATED|MODE_EXIT)_EVENT/ {
       record_state("inactive", line_timestamp())
     }
-    END { print latest_state "\t" latest_time }
+    END {
+      # Timestamp-free diagnostic fixtures need the event position to tell a
+      # repeated new start from unrelated lines appended after an old start.
+      if (watermark && latest_time == "") print latest_state "\t" latest_time "\t" latest_line
+      else print latest_state "\t" latest_time
+    }
   ' "$@"
 }
 
@@ -453,6 +461,7 @@ selected_source_suppressed=0
 stopped_debug_evidence=""
 stopped_console_evidence=""
 stopped_explicit_signature=""
+stopped_explicit_evidence=""
 clock_source_key=""
 clock_source_dirty=0
 
@@ -507,8 +516,7 @@ latest_stream_state() {
   local source_signature="$1"
   local source_key="${GFN_LOG_SOURCE_KEY:-explicit}"
   detected_stream_state_out=""
-  if (( selected_source_suppressed )) \
-      || [[ -n "$GFN_LOG_OVERRIDE" && "$source_signature" == "$stopped_explicit_signature" ]]; then
+  if (( selected_source_suppressed )); then
     return 0
   fi
   [[ -f "$GFN_LOG_FILE" && "$source_signature" != missing \
@@ -568,6 +576,15 @@ latest_stream_state() {
     evidence="$(parse_stream_evidence "$GFN_LOG_FILE" 2>/dev/null)" || return 0
     detected_state="${evidence%%$'\t'*}"
     detected_event_time="${evidence#*$'\t'}"
+  fi
+
+  if [[ -n "$GFN_LOG_OVERRIDE" && "$detected_state" == active \
+      && -n "$stopped_explicit_evidence" ]]; then
+    local explicit_watermark
+    explicit_watermark="$(parse_stream_evidence --watermark "$GFN_LOG_FILE" 2>/dev/null)" || return 0
+    # Unrelated appends change stat without establishing a new session.
+    [[ "$explicit_watermark" == "$stopped_explicit_evidence" ]] && return 0
+    stopped_explicit_evidence=""
   fi
 
   # A source switch can expose an older inactive marker from the alternate
@@ -745,6 +762,7 @@ select_log_source() {
     selected_source_available=0
     log_signature "$GFN_LOG_FILE"
     selected_signature="$log_signature_out"
+    selected_signature_out="$selected_signature"
     [[ "$selected_signature" == missing || "$selected_signature" == unreadable ]] \
       || selected_source_available=1
     selected_source_has_evidence=0
@@ -760,20 +778,26 @@ select_log_source() {
   candidate_evidence "$GFN_DEBUG_LOG" "$debug_signature" \
     "$debug_candidate_signature" "$debug_candidate_state" "$debug_candidate_time" \
     "$debug_candidate_prefix" "$debug_candidate_suffix"
-  debug_candidate_state="$candidate_state_out"
-  debug_candidate_time="$candidate_time_out"
-  debug_candidate_prefix="$candidate_prefix_out"
-  debug_candidate_suffix="$candidate_suffix_out"
-  debug_candidate_signature="$debug_signature"
+  # Keep the last proof across a missing generation during rename rotation.
+  if [[ "$debug_signature" != missing && "$debug_signature" != unreadable ]]; then
+    debug_candidate_state="$candidate_state_out"
+    debug_candidate_time="$candidate_time_out"
+    debug_candidate_prefix="$candidate_prefix_out"
+    debug_candidate_suffix="$candidate_suffix_out"
+    debug_candidate_signature="$debug_signature"
+  fi
 
   candidate_evidence "$GFN_CONSOLE_LOG" "$console_signature" \
     "$console_candidate_signature" "$console_candidate_state" "$console_candidate_time" \
     "$console_candidate_prefix" "$console_candidate_suffix"
-  console_candidate_state="$candidate_state_out"
-  console_candidate_time="$candidate_time_out"
-  console_candidate_prefix="$candidate_prefix_out"
-  console_candidate_suffix="$candidate_suffix_out"
-  console_candidate_signature="$console_signature"
+  # Keep the last proof across a missing generation during rename rotation.
+  if [[ "$console_signature" != missing && "$console_signature" != unreadable ]]; then
+    console_candidate_state="$candidate_state_out"
+    console_candidate_time="$candidate_time_out"
+    console_candidate_prefix="$candidate_prefix_out"
+    console_candidate_suffix="$candidate_suffix_out"
+    console_candidate_signature="$console_signature"
+  fi
 
   # Old active events belong to the process observed before it stopped.
   # Unrelated appends or a launcher-only reopen do not create a new session.
@@ -842,6 +866,7 @@ select_log_source() {
     selected_source_suppressed=1
   fi
   selected_source_untrusted=0
+  selected_signature_out="$selected_signature"
 }
 
 read_state_timestamp() {
@@ -1011,7 +1036,7 @@ reconcile_backup_state() {
         "GeForce NOW is running, but no recognized session state was found; backups may not be paused." \
         "GeForce NOW działa, ale nie znaleziono rozpoznanego stanu sesji; backup może nie być wstrzymany."
     elif [[ "$detected_stream_state" == inactive \
-        || ( "$detected_stream_state" == active && -f "$STATE_FILE" ) ]]; then
+        || "$detected_stream_state" == active ]]; then
       clear_detection_alert
     fi
   elif [[ "$process_state" == "unknown" ]]; then
@@ -1030,6 +1055,11 @@ reconcile_backup_state() {
     clock_source_dirty=0
     stopped_debug_evidence="$debug_candidate_state|$debug_candidate_time"
     stopped_console_evidence="$console_candidate_state|$console_candidate_time"
+    if [[ -n "$GFN_LOG_OVERRIDE" && "$source_signature" != "$stopped_explicit_signature" \
+        && "$source_signature" != missing && "$source_signature" != unreadable ]]; then
+      stopped_explicit_evidence="$(parse_stream_evidence --watermark "$GFN_LOG_FILE" 2>/dev/null)" \
+        || stopped_explicit_evidence=""
+    fi
     stopped_explicit_signature="$source_signature"
     parsed_signature=""
     parsed_identity=""
@@ -1099,6 +1129,9 @@ reconcile_backup_state() {
         "The GeForce NOW session ended, but Arq backups could not be resumed." \
         "Sesja GeForce NOW się zakończyła, ale nie udało się wznowić backupu Arq." 1
     fi
+  elif [[ "$process_state" == "running" \
+      && "$detected_stream_state" == "inactive" ]]; then
+    clear_action_alert
   fi
 }
 
@@ -1141,8 +1174,10 @@ iterations_since_reconcile=$SAFETY_ITERATIONS
 
 while true; do
   select_log_source
-  log_signature
-  current_signature="$log_signature_out"
+  # Keep evidence paired with the signature observed before its read. A write
+  # during selection must remain a change for the next iteration, not label
+  # old evidence with a newer signature and hide it behind the parsed cache.
+  current_signature="$selected_signature_out"
   should_reconcile=0
 
   if [[ "$current_signature" != "$last_signature" ]]; then

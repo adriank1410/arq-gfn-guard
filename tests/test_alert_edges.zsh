@@ -84,4 +84,22 @@ run_once 5120 60
 rm "$LOG_FILE"
 run_once 5130 0
 [[ "$(wc -l < "$ALERTS" | tr -d ' ')" == 2 ]] || { print -u2 'New episode did not notify'; exit 1; }
+
+# A recognized active session clears an old detection episode even when the
+# first pause attempt fails before an owned state file can be written.
+console_event 30 Streaming > "$LOG_FILE"
+: > "$ALERTS"
+TEST_ARQC_EXIT=42 run_once 5140 0
+[[ ! -f "$STATE_DIR/guard-alert-detection" ]] || { print -u2 'Recognized active state kept stale detection alert'; exit 1; }
+[[ -f "$STATE_DIR/guard-alert-action" ]] || { print -u2 'Initial pause failure did not create action alert'; exit 1; }
+
+# An authoritative inactive event clears the action episode, allowing the
+# next independent failed session to notify again.
+console_event 40 Done > "$LOG_FILE"
+run_once 5150 0
+[[ ! -f "$STATE_DIR/guard-alert-action" ]] || { print -u2 'Authoritative inactive state kept stale action alert'; exit 1; }
+console_event 50 Streaming > "$LOG_FILE"
+: > "$ALERTS"
+TEST_ARQC_EXIT=42 run_once 5160 0
+[[ "$(wc -l < "$ALERTS" | tr -d ' ')" == 1 ]] || { print -u2 'Next failed session did not notify'; exit 1; }
 print -r -- 'All alert edge tests passed' 

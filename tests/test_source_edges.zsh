@@ -4,6 +4,7 @@ unsetopt bg_nice
 readonly REPO="${0:A:h:h}"
 readonly ROOT="$(mktemp -d /tmp/arq-source-edges.XXXXXX)"
 readonly LOGS="$ROOT/home/Library/Application Support/NVIDIA/GeForceNOW"
+readonly EXPLICIT_LOG="$ROOT/explicit.log"
 monitor_pid=""
 trap '[[ -z "$monitor_pid" ]] || kill "$monitor_pid" 2>/dev/null || true; rm -rf "$ROOT"' EXIT
 mkdir -p "$LOGS"
@@ -24,9 +25,16 @@ print 0 > "$ROOT/process"
 debug_event() { print "[1:1:2026-09-09/ $1.000:INFO:gfn_background_agent_ipc.cpp(29)] Sending 'IPC_STREAMING_${2}_EVENT' to BackgroundAgent"; }
 console_event() { print "2026-09-09 $1.000 INFO  gfn/StreamerManagerService  Advancing to state: $2"; }
 start_guard() {
- env HOME="$ROOT/home" ARQ_GFN_ARQC="$ROOT/arqc" ARQ_GFN_STATE_DIR="$ROOT/state" \
- ARQ_GFN_GUARD_LOG="$ROOT/guard.log" ARQ_GFN_LOOP_SECONDS=1 ARQ_GFN_SAFETY_SECONDS=1 \
- ARQ_GFN_NOTIFICATIONS=0 ARQ_GFN_ERROR_NOTIFICATIONS=0 "$ROOT/guard" &
+  env HOME="$ROOT/home" ARQ_GFN_ARQC="$ROOT/arqc" ARQ_GFN_STATE_DIR="$ROOT/state" \
+  ARQ_GFN_GUARD_LOG="$ROOT/guard.log" ARQ_GFN_LOOP_SECONDS=1 ARQ_GFN_SAFETY_SECONDS=1 \
+  ARQ_GFN_NOTIFICATIONS=0 ARQ_GFN_ERROR_NOTIFICATIONS=0 "$ROOT/guard" &
+  monitor_pid=$!
+}
+start_explicit_guard() {
+ env HOME="$ROOT/home" ARQ_GFN_ARQC="$ROOT/arqc" ARQ_GFN_LOG_FILE="$EXPLICIT_LOG" \
+ ARQ_GFN_STATE_DIR="$ROOT/state" ARQ_GFN_GUARD_LOG="$ROOT/explicit-guard.log" \
+ ARQ_GFN_LOOP_SECONDS=1 ARQ_GFN_SAFETY_SECONDS=1 ARQ_GFN_NOTIFICATIONS=0 \
+ ARQ_GFN_ERROR_NOTIFICATIONS=0 "$ROOT/guard" &
  monitor_pid=$!
 }
 stop_guard() { kill "$monitor_pid"; wait "$monitor_pid" 2>/dev/null || true; monitor_pid=""; }
@@ -110,5 +118,67 @@ stop_guard
 start_guard
 console_event 02:06:00 Done >> "$LOGS/console.log"
 wait_call resumeBackups
+stop_guard
+
+# A candidate source may disappear for a poll while the other source becomes
+# selected. Its own checkpoints must survive that gap so a later marker-free
+# replacement can still authenticate an end in source.bak.
+rm -f "$LOGS"/debug.log "$LOGS"/debug.log.bak "$LOGS"/console.log "$LOGS"/console.log.bak \
+  "$ROOT/state"/guard-paused "$ROOT/state/guard-alert" \
+  "$ROOT/state/guard-alert-detection" "$ROOT/state/guard-alert-action" "$ROOT/calls"
+: > "$ROOT/calls"
+print 0 > "$ROOT/process"
+debug_event 03:00:10 STARTED > "$LOGS/debug.log"
+console_event 03:00:01 Done > "$LOGS/console.log"
+start_guard
+wait_call 'pauseBackups 10'
+: > "$ROOT/calls"
+mv "$LOGS/debug.log" "$LOGS/debug.log.bak"
+sleep 2
+debug_event 03:00:20 TERMINATED >> "$LOGS/debug.log.bak"
+print 'new debug generation' > "$LOGS/debug.log"
+wait_call resumeBackups
+stop_guard
+
+# An explicit source with only unrelated post-exit appends must not replay its
+# pre-exit active event after its stat signature changes.
+rm -f "$LOGS"/debug.log "$LOGS"/debug.log.bak "$LOGS"/console.log "$LOGS"/console.log.bak \
+  "$ROOT/state"/guard-paused "$ROOT/state/guard-alert" \
+  "$ROOT/state/guard-alert-detection" "$ROOT/state/guard-alert-action" "$EXPLICIT_LOG"
+: > "$ROOT/calls"
+print 0 > "$ROOT/process"
+console_event 03:30:10 Streaming > "$EXPLICIT_LOG"
+start_explicit_guard
+wait_call 'pauseBackups 10'
+: > "$ROOT/calls"
+print 1 > "$ROOT/process"
+wait_call resumeBackups
+: > "$ROOT/calls"
+print 'unrelated diagnostic entry' >> "$EXPLICIT_LOG"
+print 0 > "$ROOT/process"
+sleep 3
+if grep -Fq pauseBackups "$ROOT/calls" || [[ -f "$ROOT/state/guard-paused" ]]; then
+  print -u2 'Explicit source replayed a pre-exit active event'; exit 1
+fi
+console_event 03:30:20 Streaming >> "$EXPLICIT_LOG"
+wait_call 'pauseBackups 10'
+stop_guard
+# Timestamp-free explicit diagnostics use the event's position: noise must
+# not replay a start, but a repeated identical IPC start on a new line must.
+rm -f "$ROOT/state/guard-paused"
+: > "$ROOT/calls"
+print IPC_STREAMING_STARTED_EVENT > "$EXPLICIT_LOG"
+start_explicit_guard
+wait_call 'pauseBackups 10'
+: > "$ROOT/calls"
+print 1 > "$ROOT/process"
+wait_call resumeBackups
+: > "$ROOT/calls"
+print 'unrelated diagnostic entry' >> "$EXPLICIT_LOG"
+print 0 > "$ROOT/process"
+sleep 3
+[[ ! -s "$ROOT/calls" ]] || { print -u2 'Bare explicit event replayed after exit'; exit 1; }
+print IPC_STREAMING_STARTED_EVENT >> "$EXPLICIT_LOG"
+wait_call 'pauseBackups 10'
 stop_guard
 print 'All source edge tests passed' 
