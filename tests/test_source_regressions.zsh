@@ -21,6 +21,8 @@ run_guard() {
 
 new_fixture() {
   local name="$1"
+  unset TEST_PROCESS
+  export TEST_PROCESS=1
   TEST_HOME="$ROOT/$name/home"
   TEST_LOGS="$TEST_HOME/Library/Application Support/NVIDIA/GeForceNOW"
   TEST_STATE="$ROOT/$name/state"
@@ -79,6 +81,26 @@ event 12:00:00.000 Streaming "$TEST_LOGS/debug.log"
 run_guard 3260
 check test -f "$TEST_STATE/guard-paused"
 check test ! -f "$TEST_STATE/guard-stopped"
+
+# A marker-free replacement must persist its own proof before the next lease
+# renewal, so a copied .bak containing the later end can be recovered after a
+# guard restart.
+new_fixture persisted-rotation
+event 11:00:00.000 Streaming "$TEST_LOGS/debug.log"
+run_guard 4000
+check test -f "$TEST_STATE/guard-paused"
+mv "$TEST_LOGS/debug.log" "$TEST_LOGS/debug.log.previous"
+print -r -- 'diagnostic noise' > "$TEST_LOGS/debug.log"
+run_guard 4010
+replacement_identity="$(/usr/bin/stat -f '%d:%i' "$TEST_LOGS/debug.log")"
+check grep -q "^source-v[34] debug ${replacement_identity} " "$TEST_STATE/guard-paused"
+event 12:00:00.000 Done "$TEST_LOGS/debug.log"
+/bin/cp "$TEST_LOGS/debug.log" "$TEST_LOGS/debug.log.bak"
+: > "$TEST_LOGS/debug.log"
+: > "$TEST_ACTIONS"
+run_guard 4020
+check test ! -f "$TEST_STATE/guard-paused"
+check grep -q '^resumeBackups$' "$TEST_ACTIONS"
 
 # Load definitions without starting the production loop so both candidate
 # scans happen in the same selector pass and rollback resolution is observable.

@@ -485,6 +485,7 @@ selected_source_evidence_valid=1
 debug_candidate_status="unavailable"
 console_candidate_status="unavailable"
 candidate_clock_rollback_out=""
+source_checkpoint_dirty=0
 stopped_debug_evidence=""
 stopped_console_evidence=""
 stopped_explicit_signature=""
@@ -673,6 +674,8 @@ trusted_rotated_evidence() {
   local backup_file="$1.bak" backup_identity backup_size
   local proof_identity="${2-$parsed_identity}" proof_size="${3-$parsed_size}"
   local proof_prefix="${4-$parsed_prefix}" proof_suffix="${5-$parsed_suffix}"
+  local proof_event_time="${6-$parsed_event_time}"
+  local backup_evidence backup_state backup_event_time
   trusted_evidence_out=""
   [[ -n "$proof_identity" ]] || return 0
   log_signature "$backup_file"
@@ -688,6 +691,21 @@ trusted_rotated_evidence() {
            && [[ "$checkpoint_prefix_out" == "$proof_prefix" \
               && "$checkpoint_suffix_out" == "$proof_suffix" ]]; }; then
     trusted_evidence_out="$(parse_stream_evidence "$backup_file" 2>/dev/null)" || return 1
+  elif (( proof_size > 0 && backup_size > proof_size )) \
+      && [[ "$proof_event_time" =~ ^[0-9]{17}$ ]] \
+      && log_checkpoint "$proof_size" "$backup_file" \
+      && [[ "$checkpoint_prefix_out" == "$proof_prefix" ]]; then
+    # A copy-rotate changes the suffix when a new lifecycle line is appended
+    # just before rotation. The stable prefix plus a strictly newer event
+    # watermark authenticates that append without trusting an arbitrary .bak.
+    backup_evidence="$(parse_stream_evidence "$backup_file" 2>/dev/null)" || return 1
+    backup_state="${backup_evidence%%$'\t'*}"
+    backup_event_time="${backup_evidence#*$'\t'}"
+    if [[ "$backup_state" == active || "$backup_state" == inactive ]] \
+        && [[ "$backup_event_time" =~ ^[0-9]{17}$ ]] \
+        && [[ "x$backup_event_time" > "x$proof_event_time" ]]; then
+      trusted_evidence_out="$backup_evidence"
+    fi
   fi
   return 0
 }
@@ -733,6 +751,7 @@ latest_stream_state() {
     return 0
   fi
 
+  local previous_event_time="$parsed_event_time"
   local source_identity="${source_signature%:*}"
   source_identity="${source_identity%:*}"
   local source_size="${source_signature##*:}"
@@ -747,6 +766,7 @@ latest_stream_state() {
       replacement=1
     fi
   fi
+  (( replacement )) && source_checkpoint_dirty=1
   if [[ -z "$parsed_signature" ]] \
       || (( replacement || source_size - parsed_size >= LOG_SCAN_BYTES )); then
     recover=1
@@ -832,6 +852,8 @@ latest_stream_state() {
   parsed_size="$source_size"
   parsed_stream_state="$detected_state"
   parsed_event_time="${detected_event_time:-${detected_state:+-}}"
+  [[ -n "$parsed_event_time" || -z "$previous_event_time" ]] \
+    || parsed_event_time="$previous_event_time"
   parsed_source_key="$source_key"
   detected_stream_state_out="$detected_state"
 }
@@ -1356,6 +1378,26 @@ reconcile_backup_state() {
     elif [[ "$detected_stream_state" == inactive \
         || "$detected_stream_state" == active ]]; then
       clear_detection_alert
+    fi
+    if [[ "$current_stream_state" == active && -f "$STATE_FILE" \
+        && -z "$detected_stream_state" \
+        && "$parsed_signature" == "$source_signature" \
+        && "$parsed_identity" =~ ^[0-9]{1,18}:[0-9]{1,18}$ ]] \
+        && (( source_checkpoint_dirty )) \
+        && (( selected_source_available )) \
+        && (( ! selected_source_untrusted )); then
+      # Persist a marker-free replacement's identity/checkpoints immediately.
+      # This updates recovery proof only; it does not renew Arq's lease.
+      parsed_stream_state="active"
+      [[ "$parsed_event_time" =~ ^[0-9]{17}$ ]] || parsed_event_time="-"
+      source_proof_ready=1
+      if write_state_timestamp "$now_epoch"; then
+        source_checkpoint_dirty=0
+      else
+        raise_alert "state-save-failure" "$now_epoch" \
+          "Arq is paused, but the guard could not save its rotated-log recovery state." \
+          "Arq jest wstrzymany, ale guard nie zapisał stanu odzyskiwania po rotacji logu." 1
+      fi
     fi
   elif [[ "$process_state" == "unknown" ]]; then
     log_message "WARN: could not determine whether the GFN process is running"
