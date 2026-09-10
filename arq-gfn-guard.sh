@@ -834,8 +834,17 @@ candidate_evidence() {
       candidate_time="$previous_time"
     fi
   fi
-  if [[ -z "$candidate_state" && "$source_size" -gt "$LOG_SCAN_BYTES" ]]; then
-    evidence="$(parse_stream_evidence "$source_file" 2>/dev/null)" || evidence=""
+  # A verified previous scan also caches the absence of lifecycle records.
+  # Ordinary appends cannot introduce unseen events outside this tail window.
+  if [[ -z "$candidate_state" && "$source_size" -gt "$LOG_SCAN_BYTES" ]] \
+      && (( !same_source || source_size - previous_size >= LOG_SCAN_BYTES )); then
+    evidence="$(parse_stream_evidence "$source_file" 2>/dev/null)" || {
+      # Failed I/O is not an empty-history proof. Invalidate checkpoints so
+      # even an unchanged file is retried on the next selector pass.
+      candidate_prefix_out=""
+      candidate_suffix_out=""
+      return 1
+    }
     candidate_state="${evidence%%$'\t'*}"
     candidate_time="${evidence#*$'\t'}"
   fi
