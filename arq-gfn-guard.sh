@@ -438,6 +438,7 @@ parse_stream_evidence() {
 # Include one preceding byte so a window beginning exactly on a full record
 # retains it; discard the partial first line before recognizing any lifecycle.
 bounded_stream_evidence() {
+  setopt localoptions pipefail
   local source_file="$1" source_size="$2"
   if (( source_size > LOG_SCAN_BYTES )); then
     /usr/bin/tail -c "$((LOG_SCAN_BYTES + 1))" "$source_file" 2>/dev/null \
@@ -478,6 +479,11 @@ selected_source_has_evidence=0
 selected_source_available=0
 selected_source_untrusted=0
 selected_source_suppressed=0
+selected_source_evidence_invalid=0
+selected_source_evidence_valid=1
+debug_candidate_status="unavailable"
+console_candidate_status="unavailable"
+candidate_clock_rollback_out=""
 stopped_debug_evidence=""
 stopped_console_evidence=""
 stopped_explicit_signature=""
@@ -631,8 +637,9 @@ trusted_rotated_evidence() {
            && log_checkpoint "$proof_size" "$backup_file" \
            && [[ "$checkpoint_prefix_out" == "$proof_prefix" \
               && "$checkpoint_suffix_out" == "$proof_suffix" ]]; }; then
-    trusted_evidence_out="$(parse_stream_evidence "$backup_file" 2>/dev/null)" || trusted_evidence_out=""
+    trusted_evidence_out="$(parse_stream_evidence "$backup_file" 2>/dev/null)" || return 1
   fi
+  return 0
 }
 
 latest_stream_state() {
@@ -640,6 +647,11 @@ latest_stream_state() {
   local source_signature="$1"
   local source_key="${GFN_LOG_SOURCE_KEY:-explicit}"
   detected_stream_state_out=""
+  local selected_candidate_state="" selected_candidate_time=""
+  if [[ -z "$GFN_LOG_OVERRIDE" ]] && (( ! selected_source_evidence_valid )); then
+    selected_source_untrusted=1
+    return 0
+  fi
   if (( selected_source_suppressed )); then
     return 0
   fi
@@ -648,8 +660,20 @@ latest_stream_state() {
     parsed_signature=""
     return 0
   }
+  if [[ -z "$GFN_LOG_OVERRIDE" ]]; then
+    if [[ "$source_key" == debug ]]; then
+      selected_candidate_state="$debug_candidate_state"
+      selected_candidate_time="$debug_candidate_time"
+    else
+      selected_candidate_state="$console_candidate_state"
+      selected_candidate_time="$console_candidate_time"
+    fi
+  fi
   if [[ "$source_signature" == "$parsed_signature" ]] \
       && [[ "$source_key" == "$parsed_source_key" ]] \
+      && { [[ -n "$GFN_LOG_OVERRIDE" ]] \
+        || [[ "$selected_candidate_state" == "$parsed_stream_state" \
+          && "${selected_candidate_time:-${selected_candidate_state:+-}}" == "$parsed_event_time" ]]; } \
       && log_checkpoint "$parsed_size" \
       && [[ "$checkpoint_prefix_out" == "$parsed_prefix" \
          && "$checkpoint_suffix_out" == "$parsed_suffix" ]]; then
@@ -662,7 +686,7 @@ latest_stream_state() {
   local source_identity="${source_signature%:*}"
   source_identity="${source_identity%:*}"
   local source_size="${source_signature##*:}"
-  local recover=0 replacement=0 detected_state detected_event_time evidence
+  local recover=0 replacement=0 detected_state detected_event_time evidence stale_alternate=0
   local previous_source_key="$parsed_source_key"
   if [[ -n "$parsed_identity" ]]; then
     if [[ "$source_identity" != "$parsed_identity" ]] || (( source_size <= parsed_size )); then
@@ -678,7 +702,6 @@ latest_stream_state() {
     recover=1
   fi
 
-  source_proof_ready=0
   if [[ -z "$GFN_LOG_OVERRIDE" ]]; then
     # The selector already validated this source, including its own rotated
     # backup. Reuse that evidence rather than reparsing against another file's
@@ -725,11 +748,14 @@ latest_stream_state() {
       detected_state=""
       detected_event_time=""
       selected_source_untrusted=1
+      stale_alternate=1
     fi
   fi
-  if [[ -n "$detected_state" ]]; then
-    source_proof_ready=1
-  elif (( ! recover )); then
+  if (( stale_alternate )); then
+    detected_stream_state_out=""
+    return 0
+  fi
+  if [[ -z "$detected_state" ]] && (( ! recover )); then
     detected_state="$parsed_stream_state"
     detected_event_time="$parsed_event_time"
   fi
@@ -737,20 +763,21 @@ latest_stream_state() {
     # A last end event may have moved to .bak before we saw it. Only trust
     # the prior source inode, or a copy matching its recorded checkpoints;
     # an unrelated backup from an older session must never resume Arq.
-    trusted_rotated_evidence "$GFN_LOG_FILE"
+    trusted_rotated_evidence "$GFN_LOG_FILE" || return 0
     if [[ -n "$trusted_evidence_out" ]]; then
         detected_state="${trusted_evidence_out%%$'\t'*}"
         detected_event_time="${trusted_evidence_out#*$'\t'}"
         # The trusted old source proves this new file continues the lease.
         # Persist its identity too, so successive rotations remain recoverable.
-        [[ -z "$detected_state" ]] || source_proof_ready=1
     fi
   fi
+  source_proof_ready=0
   parsed_signature=""
   if log_checkpoint "$source_size"; then
     parsed_prefix="$checkpoint_prefix_out"
     parsed_suffix="$checkpoint_suffix_out"
     parsed_signature="$source_signature"
+    [[ "$detected_state" != active ]] || source_proof_ready=1
   fi
   parsed_identity="$source_identity"
   parsed_size="$source_size"
@@ -794,6 +821,7 @@ candidate_evidence() {
   local previous_clock_baseline="$clock_console_baseline"
   [[ "$source_file" == "$GFN_DEBUG_LOG" ]] && previous_clock_baseline="$clock_debug_baseline"
 
+  candidate_clock_rollback_out=0
   candidate_state_out=""
   candidate_time_out=""
   candidate_prefix_out=""
@@ -824,7 +852,7 @@ candidate_evidence() {
       return 0
     fi
   fi
-  evidence="$(bounded_stream_evidence "$source_file" "$source_size")" || evidence=""
+  evidence="$(bounded_stream_evidence "$source_file" "$source_size")" || return 1
   candidate_state="${evidence%%$'\t'*}"
   candidate_time="${evidence#*$'\t'}"
   if [[ -z "$candidate_state" && -n "$previous_state" ]] \
@@ -852,7 +880,7 @@ candidate_evidence() {
   # marker in the alternate source. Unknown backups remain ineligible.
   if [[ -z "$candidate_state" && "$previous_identity" == *:* ]]; then
     trusted_rotated_evidence "$source_file" "$previous_identity" "$previous_size" \
-      "$previous_prefix" "$previous_suffix"
+      "$previous_prefix" "$previous_suffix" || return 1
     if [[ -n "$trusted_evidence_out" ]]; then
       candidate_state="${trusted_evidence_out%%$'\t'*}"
       candidate_time="${trusted_evidence_out#*$'\t'}"
@@ -861,7 +889,7 @@ candidate_evidence() {
   if [[ -z "$candidate_state" ]] \
       && { [[ "$source_file" == "$GFN_DEBUG_LOG" && "$parsed_source_key" == debug ]] \
         || [[ "$source_file" == "$GFN_CONSOLE_LOG" && "$parsed_source_key" == console ]]; }; then
-    trusted_rotated_evidence "$source_file"
+    trusted_rotated_evidence "$source_file" || return 1
     if [[ -n "$trusted_evidence_out" ]]; then
       candidate_state="${trusted_evidence_out%%$'\t'*}"
       candidate_time="${trusted_evidence_out#*$'\t'}"
@@ -875,8 +903,7 @@ candidate_evidence() {
       && "$previous_time" =~ ^[0-9]{17}$ && "x$candidate_time" < "x$previous_time" ]]; then
     local observed_clock_key=console
     [[ "$source_file" == "$GFN_DEBUG_LOG" ]] && observed_clock_key=debug
-    [[ "$clock_source_key" == "$observed_clock_key" ]] || clock_source_dirty=1
-    clock_source_key="$observed_clock_key"
+    candidate_clock_rollback_out=1
   fi
   candidate_state_out="$candidate_state"
   candidate_time_out="$candidate_time"
@@ -884,13 +911,22 @@ candidate_evidence() {
     candidate_prefix_out="$checkpoint_prefix_out"
     candidate_suffix_out="$checkpoint_suffix_out"
   fi
+  return 0
 }
 
 select_log_source() {
   local debug_signature console_signature selected_signature selected_state
   local debug_state console_state
   local debug_available=0 console_available=0
+  local debug_evidence_valid=1 console_evidence_valid=1
+  local debug_clock_rollback=0 console_clock_rollback=0
+  local observed_clock_key=""
   selected_source_suppressed=0
+  selected_source_evidence_invalid=0
+  selected_source_evidence_valid=1
+  debug_candidate_status="unavailable"
+  console_candidate_status="unavailable"
+  candidate_clock_rollback_out=0
 
   if [[ -n "$GFN_LOG_OVERRIDE" ]]; then
     GFN_LOG_FILE="$GFN_LOG_OVERRIDE"
@@ -903,6 +939,8 @@ select_log_source() {
       || selected_source_available=1
     selected_source_has_evidence=0
     selected_source_untrusted=0
+    selected_source_evidence_invalid=0
+    selected_source_evidence_valid=1
     return 0
   fi
 
@@ -911,34 +949,73 @@ select_log_source() {
   log_signature "$GFN_CONSOLE_LOG"
   console_signature="$log_signature_out"
 
-  candidate_evidence "$GFN_DEBUG_LOG" "$debug_signature" \
+  if candidate_evidence "$GFN_DEBUG_LOG" "$debug_signature" \
     "$debug_candidate_signature" "$debug_candidate_state" "$debug_candidate_time" \
-    "$debug_candidate_prefix" "$debug_candidate_suffix"
-  # Keep the last proof across a missing generation during rename rotation.
-  if [[ "$debug_signature" != missing && "$debug_signature" != unreadable ]]; then
-    debug_candidate_state="$candidate_state_out"
-    debug_candidate_time="$candidate_time_out"
-    debug_candidate_prefix="$candidate_prefix_out"
-    debug_candidate_suffix="$candidate_suffix_out"
-    debug_candidate_signature="$debug_signature"
+    "$debug_candidate_prefix" "$debug_candidate_suffix"; then
+    if [[ "$debug_signature" != missing && "$debug_signature" != unreadable ]]; then
+      debug_candidate_status="valid"
+      debug_candidate_state="$candidate_state_out"
+      debug_candidate_time="$candidate_time_out"
+      debug_candidate_prefix="$candidate_prefix_out"
+      debug_candidate_suffix="$candidate_suffix_out"
+      debug_candidate_signature="$debug_signature"
+    fi
+  else
+    debug_candidate_status="error"
+    debug_evidence_valid=0
   fi
+  debug_clock_rollback="$candidate_clock_rollback_out"
 
-  candidate_evidence "$GFN_CONSOLE_LOG" "$console_signature" \
+  if candidate_evidence "$GFN_CONSOLE_LOG" "$console_signature" \
     "$console_candidate_signature" "$console_candidate_state" "$console_candidate_time" \
-    "$console_candidate_prefix" "$console_candidate_suffix"
-  # Keep the last proof across a missing generation during rename rotation.
-  if [[ "$console_signature" != missing && "$console_signature" != unreadable ]]; then
-    console_candidate_state="$candidate_state_out"
-    console_candidate_time="$candidate_time_out"
-    console_candidate_prefix="$candidate_prefix_out"
-    console_candidate_suffix="$candidate_suffix_out"
-    console_candidate_signature="$console_signature"
+    "$console_candidate_prefix" "$console_candidate_suffix"; then
+    if [[ "$console_signature" != missing && "$console_signature" != unreadable ]]; then
+      console_candidate_status="valid"
+      console_candidate_state="$candidate_state_out"
+      console_candidate_time="$candidate_time_out"
+      console_candidate_prefix="$candidate_prefix_out"
+      console_candidate_suffix="$candidate_suffix_out"
+      console_candidate_signature="$console_signature"
+    fi
+  else
+    console_candidate_status="error"
+    console_evidence_valid=0
+  fi
+  console_clock_rollback="$candidate_clock_rollback_out"
+
+  # Resolve both rollback observations only after both sources have been read.
+  # A later event wins; an equal-time active event wins conservatively over an
+  # inactive event. If both states agree, retain the existing pin when possible.
+  if (( debug_clock_rollback && console_clock_rollback )); then
+    if [[ "x$debug_candidate_time" > "x$console_candidate_time" ]]; then
+      observed_clock_key=debug
+    elif [[ "x$console_candidate_time" > "x$debug_candidate_time" ]]; then
+      observed_clock_key=console
+    elif [[ "$debug_candidate_state" == active && "$console_candidate_state" != active ]]; then
+      observed_clock_key=debug
+    elif [[ "$console_candidate_state" == active && "$debug_candidate_state" != active ]]; then
+      observed_clock_key=console
+    elif [[ "$clock_source_key" == debug || "$clock_source_key" == console ]]; then
+      observed_clock_key="$clock_source_key"
+    else
+      observed_clock_key=debug
+    fi
+  elif (( debug_clock_rollback )); then
+    observed_clock_key=debug
+  elif (( console_clock_rollback )); then
+    observed_clock_key=console
+  fi
+  if [[ -n "$observed_clock_key" ]]; then
+    [[ "$clock_source_key" == "$observed_clock_key" ]] || clock_source_dirty=1
+    clock_source_key="$observed_clock_key"
   fi
 
   # Old active events belong to the process observed before it stopped.
   # Unrelated appends or a launcher-only reopen do not create a new session.
   debug_state="$debug_candidate_state"
   console_state="$console_candidate_state"
+  (( debug_evidence_valid )) || debug_state=""
+  (( console_evidence_valid )) || console_state=""
   # An end after clock rollback supersedes the other source's old epoch.
   # Keep its fingerprint excluded through noise appends until a new event.
   [[ "$debug_state|$debug_candidate_time" == "$clock_debug_baseline" ]] && debug_state=""
@@ -1006,6 +1083,16 @@ select_log_source() {
     selected_source_suppressed=1
   fi
   selected_source_untrusted=0
+  if [[ "$GFN_LOG_SOURCE_KEY" == debug ]]; then
+    selected_source_evidence_valid="$debug_evidence_valid"
+  else
+    selected_source_evidence_valid="$console_evidence_valid"
+  fi
+  if (( ! selected_source_evidence_valid )); then
+    selected_source_evidence_invalid=1
+    selected_source_has_evidence=0
+    selected_source_suppressed=0
+  fi
   selected_signature_out="$selected_signature"
 }
 
@@ -1104,10 +1191,11 @@ restore_source_checkpoint() {
     parsed_identity="$proof_identity"
     parsed_size="$proof_size"
     parsed_stream_state="active"
-    parsed_event_time="${proof_event_time/-/}"
+    parsed_event_time="$proof_event_time"
     parsed_source_key="$proof_source_key"
     parsed_prefix="$prefix_data"
     parsed_suffix="$suffix_data"
+    source_proof_ready=1
   } always {
     exec {proof_fd}<&-
   }
@@ -1127,14 +1215,14 @@ write_state_timestamp() {
   }
   if ! {
     print -r -- "$epoch_value" && {
-      if (( source_proof_ready )) && [[ -n "$parsed_signature" \
-          && -n "$GFN_LOG_SOURCE_KEY" \
+      if (( source_proof_ready )) && [[ "$parsed_stream_state" == active \
+          && -n "$parsed_source_key" \
           && ( "$parsed_event_time" == - || "$parsed_event_time" =~ ^[0-9]{17}$ ) ]]; then
         if [[ -n "$clock_pending_payload$clock_saved_snapshot" || "$clock_revision" != 0 ]]; then
-          print -r -- "source-v4 $GFN_LOG_SOURCE_KEY $parsed_identity $parsed_size $parsed_event_time ${clock_source_key:--} $clock_revision ${clock_debug_baseline:--} ${clock_console_baseline:--}" \
+          print -r -- "source-v4 $parsed_source_key $parsed_identity $parsed_size $parsed_event_time ${clock_source_key:--} $clock_revision ${clock_debug_baseline:--} ${clock_console_baseline:--}" \
             && print -rn -- "$parsed_prefix$parsed_suffix"
         else
-          print -r -- "source-v3 $GFN_LOG_SOURCE_KEY $parsed_identity $parsed_size $parsed_event_time ${clock_source_key:--}" \
+          print -r -- "source-v3 $parsed_source_key $parsed_identity $parsed_size $parsed_event_time ${clock_source_key:--}" \
             && print -rn -- "$parsed_prefix$parsed_suffix"
         fi
       elif [[ -f "$STATE_FILE" ]]; then
