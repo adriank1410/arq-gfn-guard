@@ -101,6 +101,33 @@ run_selector_case rollback-console-active Done Streaming console active
 run_selector_case rollback-debug-end Done Streaming console active
 run_selector_case rollback-console-end Streaming Done debug active
 
+# The source-switch guard is symmetric: an older active marker from the
+# alternate file must not resurrect a session already proven inactive.
+run_inactive_switch_case() (
+  root="$ROOT/stale-active"
+  mkdir -p "$root/home/Library/Application Support/NVIDIA/GeForceNOW" "$root/state"
+  export HOME="$root/home" ARQ_GFN_STATE_DIR="$root/state" ARQ_GFN_GUARD_LOG="$root/guard.log" \
+    ARQ_GFN_ARQC="$root/arqc" ARQ_GFN_FORCE_PROCESS=1 ARQ_GFN_NOTIFICATIONS=0 \
+    ARQ_GFN_ERROR_NOTIFICATIONS=0 ARQ_GFN_LANG=en ARQ_TEST_ACTIONS="$root/actions"
+  print -r -- '#!/bin/zsh' > "$root/arqc"
+  print -r -- 'print -r -- "$*" >> "$ARQ_TEST_ACTIONS"' >> "$root/arqc"
+  chmod 700 "$root/arqc"
+  : > "$ARQ_TEST_ACTIONS"
+  source <(/usr/bin/awk '/^restore_source_checkpoint \|\| true$/ { exit } { print }' "$GUARD")
+  event 11:00:00.000 Done "$GFN_DEBUG_LOG"
+  select_log_source
+  reconcile_backup_state 2000 "$selected_signature_out"
+  event 10:00:00.000 Streaming "$GFN_CONSOLE_LOG"
+  mv "$GFN_DEBUG_LOG" "$root/debug.log.removed"
+  select_log_source
+  reconcile_backup_state 2010 "$selected_signature_out"
+  if grep -q '^pauseBackups' "$ARQ_TEST_ACTIONS"; then
+    print -u2 -- 'FAIL: stale alternate active marker paused Arq after inactive proof'
+    exit 1
+  fi
+)
+run_inactive_switch_case
+
 # A transient full-scan error must not poison parsed state; an unchanged file
 # is retried and the successful scan establishes the active lease.
 (

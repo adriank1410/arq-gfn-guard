@@ -734,15 +734,15 @@ latest_stream_state() {
     stopped_explicit_evidence=""
   fi
 
-  # A source switch can expose an older inactive marker from the alternate
-  # file after the owned active source was removed. Without a newer timestamp,
-  # that marker is not evidence that this lease ended. Keep the lease alive;
-  # the normal missing/unknown alert tells the user that the source is gone.
+  # A source switch can expose an older lifecycle marker from the alternate
+  # file after the selected source was removed. Without a newer timestamp,
+  # neither an older end nor an older start proves a new state. Preserve the
+  # last parsed proof and let the normal missing/unknown alert expose the gap.
   selected_source_untrusted=0
   if [[ "$previous_source_key" != "$source_key" && "$clock_source_key" != "$source_key" ]] \
       && [[ "$previous_source_key" != legacy || "$source_identity" != "$parsed_identity" ]] \
-      && [[ "$parsed_stream_state" == active ]] \
-      && [[ "$detected_state" == inactive ]]; then
+      && { [[ "$parsed_stream_state" == active && "$detected_state" == inactive ]] \
+        || [[ "$parsed_stream_state" == inactive && "$detected_state" == active ]]; }; then
     if [[ -z "$detected_event_time" || -z "$parsed_event_time" || "$parsed_event_time" == - ]] \
         || [[ -n "$parsed_event_time" && "$detected_event_time" < "$parsed_event_time" ]]; then
       detected_state=""
