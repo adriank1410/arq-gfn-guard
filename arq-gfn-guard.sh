@@ -368,9 +368,16 @@ gfn_process_state() {
 }
 
 parse_stream_evidence() {
-  local watermark=0
-  if [[ "${1:-}" == --watermark ]]; then watermark=1; shift; fi
-  /usr/bin/awk -v watermark="$watermark" '
+  local watermark=0 skip_first_line=0
+  while [[ "${1:-}" == --watermark || "${1:-}" == --skip-first-line ]]; do
+    case "$1" in
+      --watermark) watermark=1 ;;
+      --skip-first-line) skip_first_line=1 ;;
+    esac
+    shift
+  done
+  /usr/bin/awk -v watermark="$watermark" -v skip_first_line="$skip_first_line" '
+    NR == 1 && skip_first_line { next }
     function normalized_timestamp(value) {
       gsub(/[-\/:. ]/, "", value)
       return value
@@ -428,6 +435,18 @@ parse_stream_evidence() {
   ' "$@"
 }
 
+# Include one preceding byte so a window beginning exactly on a full record
+# retains it; discard the partial first line before recognizing any lifecycle.
+bounded_stream_evidence() {
+  local source_file="$1" source_size="$2"
+  if (( source_size > LOG_SCAN_BYTES )); then
+    /usr/bin/tail -c "$((LOG_SCAN_BYTES + 1))" "$source_file" 2>/dev/null \
+      | parse_stream_evidence --skip-first-line
+  else
+    /usr/bin/tail -c "$LOG_SCAN_BYTES" "$source_file" 2>/dev/null | parse_stream_evidence
+  fi
+}
+
 # The lease records a successful owned pause and its source evidence. After
 # restart, that evidence can authenticate a rotated log; unrelated backups
 # cannot establish whether the owned session ended.
@@ -468,6 +487,9 @@ clock_source_dirty=0
 clock_debug_baseline=""
 clock_console_baseline=""
 clock_saved_snapshot=""
+clock_pending_payload=""
+clock_revision=0
+owned_clock_revision=-1
 clock_failure_logged=0
 clock_failure_notified=0
 
@@ -486,32 +508,72 @@ clock_state_failure() {
 
 restore_clock_state() {
   [[ -e "$CLOCK_STATE_FILE" || -L "$CLOCK_STATE_FILE" ]] || return 0
-  local version saved_key saved_debug saved_console extra
+  local version saved_revision saved_key saved_debug saved_console extra
+  local saved_payload apply_clock=1
   local baseline_pattern='^(active|inactive)?[|]([0-9]{17})?$'
   if [[ ! -f "$CLOCK_STATE_FILE" ]] \
       || ! IFS=' ' read -r version saved_key saved_debug saved_console extra < "$CLOCK_STATE_FILE"; then
     clock_state_failure
     return 1
   fi
-  if [[ "$version" != clock-v1 || -n "$extra" ]] \
+  if [[ "$version" == clock-v1 ]]; then
+    saved_revision=0
+  elif [[ "$version" == clock-v2 ]]; then
+    # The revision is read from the second field, so re-read the complete
+    # record with the v2 layout before validating its payload.
+    IFS=' ' read -r version saved_revision saved_key saved_debug saved_console extra < "$CLOCK_STATE_FILE" \
+      || { clock_state_failure; return 1; }
+    [[ "$saved_revision" =~ ^(0|[1-9][0-9]{0,17})$ ]] || {
+      clock_state_failure
+      return 1
+    }
+  else
+    clock_state_failure
+    return 1
+  fi
+  if [[ -n "$extra" ]] \
       || [[ "$saved_key" != - && "$saved_key" != debug && "$saved_key" != console ]] \
       || [[ "$saved_debug" != - && ! "$saved_debug" =~ "$baseline_pattern" ]] \
       || [[ "$saved_console" != - && ! "$saved_console" =~ "$baseline_pattern" ]]; then
     clock_state_failure
     return 1
   fi
-  clock_source_key="${saved_key/-/}"
-  clock_debug_baseline="${saved_debug/-/}"
-  clock_console_baseline="${saved_console/-/}"
-  clock_saved_snapshot="clock-v1 $saved_key $saved_debug $saved_console"
+  saved_payload="$saved_key $saved_debug $saved_console"
+  if (( owned_clock_revision >= 0 && saved_revision < owned_clock_revision )); then
+    apply_clock=0
+  fi
+  if (( apply_clock )); then
+    clock_source_key="${saved_key/-/}"
+    clock_debug_baseline="${saved_debug/-/}"
+    clock_console_baseline="${saved_console/-/}"
+    clock_revision="$saved_revision"
+    clock_pending_payload="$saved_payload"
+  fi
+  if [[ "$version" == clock-v2 ]]; then
+    clock_saved_snapshot="clock-v2 $saved_revision $saved_payload"
+  else
+    clock_saved_snapshot="clock-v1 $saved_payload"
+  fi
 }
 
 write_clock_state() {
-  local snapshot="clock-v1 ${clock_source_key:--} ${clock_debug_baseline:--} ${clock_console_baseline:--}"
-  local temporary_clock=""
+  local payload="${clock_source_key:--} ${clock_debug_baseline:--} ${clock_console_baseline:--}"
+  local snapshot temporary_clock=""
+  # A changed payload advances the monotonic ordering once, before the
+  # filesystem write. A retry after a failed write keeps the same revision.
+  [[ -n "$clock_pending_payload$clock_saved_snapshot$clock_source_key$clock_debug_baseline$clock_console_baseline" ]] || return 0
+  if [[ "$payload" != "$clock_pending_payload" ]]; then
+    [[ "$clock_revision" =~ ^(0|[1-9][0-9]{0,17})$ ]] \
+      && (( clock_revision < 999999999999999999 )) || {
+      clock_state_failure
+      return 1
+    }
+    clock_revision=$(( clock_revision + 1 ))
+    clock_pending_payload="$payload"
+  fi
+  snapshot="clock-v2 $clock_revision $payload"
   # No file is needed until a clock episode occurs. Unlike guard-paused, this
   # history survives a successful resume and protects launcher-only restarts.
-  [[ -n "$clock_source_key$clock_debug_baseline$clock_console_baseline$clock_saved_snapshot" ]] || return 0
   [[ "$snapshot" == "$clock_saved_snapshot" && -f "$CLOCK_STATE_FILE" ]] && return 0
   temporary_clock="$(/usr/bin/mktemp "$STATE_DIR/.guard-clock.XXXXXX")" || temporary_clock=""
   if [[ -n "$temporary_clock" && ! -d "$CLOCK_STATE_FILE" ]] \
@@ -627,7 +689,7 @@ latest_stream_state() {
       evidence="$console_candidate_state"$'\t'"$console_candidate_time"
     fi
   else
-    evidence="$(/usr/bin/tail -c "$LOG_SCAN_BYTES" "$GFN_LOG_FILE" 2>/dev/null | parse_stream_evidence)" || return 0
+    evidence="$(bounded_stream_evidence "$GFN_LOG_FILE" "$source_size")" || return 0
   fi
   detected_state="${evidence%%$'\t'*}"
   detected_event_time="${evidence#*$'\t'}"
@@ -762,7 +824,7 @@ candidate_evidence() {
       return 0
     fi
   fi
-  evidence="$(/usr/bin/tail -c "$LOG_SCAN_BYTES" "$source_file" 2>/dev/null | parse_stream_evidence)" || evidence=""
+  evidence="$(bounded_stream_evidence "$source_file" "$source_size")" || evidence=""
   candidate_state="${evidence%%$'\t'*}"
   candidate_time="${evidence#*$'\t'}"
   if [[ -z "$candidate_state" && -n "$previous_state" ]] \
@@ -953,12 +1015,15 @@ read_state_timestamp() {
 # header and two raw byte checkpoints follow; no stored text is evaluated.
 restore_source_checkpoint() {
   [[ "$has_system" == true && -f "$STATE_FILE" ]] || return 1
-  local proof_fd saved_epoch proof_version proof_source_key proof_identity proof_size proof_event_time proof_clock_key extra
+  local proof_fd saved_epoch proof_version proof_source_key proof_identity proof_size proof_event_time proof_clock_key
+  local proof_clock_revision proof_debug_baseline proof_console_baseline extra
   local prefix_data="" suffix_data="" chunk_size bytes_read legacy_proof=0
+  local baseline_pattern='^(active|inactive)?[|]([0-9]{17})?$'
   { exec {proof_fd}< "$STATE_FILE"; } 2>/dev/null || return 1
   {
     IFS= read -r -u "$proof_fd" saved_epoch || return 1
-    IFS=' ' read -r -u "$proof_fd" proof_version proof_source_key proof_identity proof_size proof_event_time proof_clock_key extra || return 1
+    IFS=' ' read -r -u "$proof_fd" proof_version proof_source_key proof_identity proof_size proof_event_time \
+      proof_clock_key proof_clock_revision proof_debug_baseline proof_console_baseline extra || return 1
     [[ "$saved_epoch" =~ ^[0-9]+$ && ${#saved_epoch} -le 18 ]] || return 1
     if [[ "$proof_version" == source-v1 ]]; then
       # Old state has no source path or event watermark. It remains usable for
@@ -968,6 +1033,7 @@ restore_source_checkpoint() {
       proof_identity="$proof_source_key"
       proof_source_key="legacy"
       proof_event_time="-"
+      [[ -z "$proof_clock_key$proof_clock_revision$proof_debug_baseline$proof_console_baseline$extra" ]] || return 1
     elif [[ ( "$proof_version" == source-v2 || "$proof_version" == source-v3 ) \
        && "$proof_source_key" =~ ^[A-Za-z0-9_.-]+$ \
        && "$proof_identity" =~ ^[0-9]{1,18}:[0-9]{1,18}$ \
@@ -976,9 +1042,21 @@ restore_source_checkpoint() {
        && -z "$extra" ]]; then
       if [[ "$proof_version" == source-v3 ]]; then
         [[ "$proof_clock_key" == - || "$proof_clock_key" == debug || "$proof_clock_key" == console ]] || return 1
+        [[ -z "$proof_clock_revision$proof_debug_baseline$proof_console_baseline" ]] || return 1
       else
         [[ -z "$proof_clock_key" ]] || return 1
       fi
+      legacy_proof=0
+    elif [[ "$proof_version" == source-v4 \
+       && "$proof_source_key" =~ ^[A-Za-z0-9_.-]+$ \
+       && "$proof_identity" =~ ^[0-9]{1,18}:[0-9]{1,18}$ \
+       && "$proof_size" =~ ^[0-9]+$ && ${#proof_size} -le 18 \
+       && ( "$proof_event_time" == - || "$proof_event_time" =~ ^[0-9]{17}$ ) \
+       && ( "$proof_clock_key" == - || "$proof_clock_key" == debug || "$proof_clock_key" == console ) \
+       && "$proof_clock_revision" =~ ^(0|[1-9][0-9]{0,17})$ \
+       && ( "$proof_debug_baseline" == - || "$proof_debug_baseline" =~ "$baseline_pattern" ) \
+       && ( "$proof_console_baseline" == - || "$proof_console_baseline" =~ "$baseline_pattern" ) \
+       && -z "$extra" ]]; then
       legacy_proof=0
     else
       return 1
@@ -997,6 +1075,22 @@ restore_source_checkpoint() {
     fi
     if [[ "$proof_version" == source-v3 && "$proof_clock_key" != - ]]; then
       clock_source_key="$proof_clock_key"
+    fi
+    if [[ "$proof_version" == source-v4 ]]; then
+      clock_source_key="${proof_clock_key/-/}"
+      clock_debug_baseline="${proof_debug_baseline/-/}"
+      clock_console_baseline="${proof_console_baseline/-/}"
+      clock_revision="$proof_clock_revision"
+      clock_pending_payload="$proof_clock_key $proof_debug_baseline $proof_console_baseline"
+      owned_clock_revision="$proof_clock_revision"
+    elif [[ "$proof_version" == source-v3 && "$proof_clock_key" != - ]]; then
+      clock_revision=0
+      clock_pending_payload="$proof_clock_key - -"
+      # Legacy source proofs have no ordering metadata; an independent
+      # guard-clock record must retain the pre-v4 restore behavior.
+      owned_clock_revision=-1
+    else
+      owned_clock_revision=-1
     fi
     parsed_identity="$proof_identity"
     parsed_size="$proof_size"
@@ -1027,8 +1121,13 @@ write_state_timestamp() {
       if (( source_proof_ready )) && [[ -n "$parsed_signature" \
           && -n "$GFN_LOG_SOURCE_KEY" \
           && ( "$parsed_event_time" == - || "$parsed_event_time" =~ ^[0-9]{17}$ ) ]]; then
-        print -r -- "source-v3 $GFN_LOG_SOURCE_KEY $parsed_identity $parsed_size $parsed_event_time ${clock_source_key:--}" \
-          && print -rn -- "$parsed_prefix$parsed_suffix"
+        if [[ -n "$clock_pending_payload$clock_saved_snapshot" || "$clock_revision" != 0 ]]; then
+          print -r -- "source-v4 $GFN_LOG_SOURCE_KEY $parsed_identity $parsed_size $parsed_event_time ${clock_source_key:--} $clock_revision ${clock_debug_baseline:--} ${clock_console_baseline:--}" \
+            && print -rn -- "$parsed_prefix$parsed_suffix"
+        else
+          print -r -- "source-v3 $GFN_LOG_SOURCE_KEY $parsed_identity $parsed_size $parsed_event_time ${clock_source_key:--}" \
+            && print -rn -- "$parsed_prefix$parsed_suffix"
+        fi
       elif [[ -f "$STATE_FILE" ]]; then
         # Keep the last proven source while rotation hides current events.
         /usr/bin/tail -n +2 "$STATE_FILE"
