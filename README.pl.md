@@ -39,6 +39,8 @@ Alerty błędów są niezależne od zwykłych powiadomień. Brak źródeł lub n
 
 Zdarzenia sesji pochodzą z `debug.log` oraz `console.log` w `~/Library/Application Support/NVIDIA/GeForceNOW/`, zweryfikowanych lokalnie w GFN 2.0.87 i 2.0.88. Mniejszy `debug.log` zawiera `IPC_STREAMING_PREPARE/STARTING/SESSION_SETUP/STARTED_EVENT` oraz `IPC_STREAMING_TERMINATED/MODE_EXIT_EVENT`. Alternatywny `console.log` zawiera stany `Loading` / `Streaming` oraz `PostSessionConnection` / `PostStreaming` / `Done`. Wybór uwzględnia czas zdarzenia, aby stary wpis w jednym pliku nie przesłonił nowej sesji w drugim. W lokalnej wersji 2.0.88 stare `logs/gfn_reliability_monitor.log` i `logs/gameStreamClientAgent.log` nie zawierały nowej sesji, dlatego nie są automatycznymi alternatywami. `ARQ_GFN_LOG_FILE` przy bezpośrednim uruchomieniu ogranicza odczyt do jawnie wskazanego pliku; starszy format pozostaje obsługiwany.
 
+Po zaobserwowaniu cofnięcia czasu w dopisanych zdarzeniach guard korzysta z tego źródła do zamknięcia procesu GFN, zamiast porównywać je ze starym zegarem drugiego pliku. Zachowuje ten wybór przy restarcie z aktywną pauzą. Brak tego źródła wywoła alert i podtrzymanie własnej pauzy. Cofnięcia czasu sprzed uruchomienia guarda nie da się jednoznacznie rozpoznać z logów bez strefy czasowej. Po zaobserwowanym zamknięciu GFN stare wpisy startu nie uruchamiają ponownej pauzy przy samym otwarciu launchera.
+
 **Dlaczego stałe sprawdzanie co dwie sekundy zamiast `launchd` `WatchPaths`?**
 
 Wcześniejszy wariant `WatchPaths` wyglądał lepiej na papierze, ale macOS scalał lub opóźniał zdarzenia na tyle, że zarówno pauza, jak i wznowienie następowały zbyt późno. Obecna szybka ścieżka spoczynkowa nie analizuje logu ani nie wywołuje `pgrep`: sprawdza sygnatury obu plików przez `zsh/stat` oraz małe fragmenty kontrolne przez `zsh/system`, a następnie zasypia przez `zselect`. `tail`, `awk`, sprawdzenie procesu i odczyt zegara uruchamiają się dopiero po zmianie logu albo podczas kontrolnego uzgodnienia co 60 sekund.
@@ -123,7 +125,7 @@ ARQ_GFN_LOOP_SECONDS=5 ./install.sh
 |---|---|
 | `arq-gfn-guard.sh` | `~/Library/Application Support/ArqGFNGuard/arq-gfn-guard.sh` |
 | `com.local.arq-gfn-guard.plist` | `~/Library/LaunchAgents/com.local.arq-gfn-guard.plist` *(generowany przez instalator)* |
-| *(tworzony podczas działania)* | `~/Library/Application Support/ArqGFNGuard/guard-paused` oraz `guard-alert` |
+| *(tworzony podczas działania)* | `~/Library/Application Support/ArqGFNGuard/guard-paused` oraz `guard-alert-detection`, `guard-alert-action` |
 | *(tworzony podczas działania)* | `~/Library/Logs/ArqGFNGuard/guard.log` |
 | *(wyjście launchd)* | `~/Library/Logs/ArqGFNGuard/launchd.out.log` oraz `launchd.err.log` |
 
@@ -132,9 +134,11 @@ ARQ_GFN_LOOP_SECONDS=5 ./install.sh
 Testy używają odizolowanych logów i stanu oraz atrap `arqc`, zegara, odczytu procesu i powiadomień. Nigdy nie wstrzymują prawdziwej instalacji Arq.
 
 ```bash
-zsh -n arq-gfn-guard.sh install.sh uninstall.sh tests/test_guard.zsh
+for script_file in arq-gfn-guard.sh install.sh uninstall.sh tests/*.zsh; do zsh -n "$script_file" || break; done
 zsh tests/test_guard.zsh
 zsh tests/test_sources.zsh
+zsh tests/test_source_edges.zsh
+zsh tests/test_alert_edges.zsh
 plutil -lint com.local.arq-gfn-guard.plist
 ```
 

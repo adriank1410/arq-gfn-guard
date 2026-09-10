@@ -188,14 +188,16 @@ assert_resumed
 debug_event 30 STARTED > "$GFN_DIR/debug.log"
 run_once 11480
 assert_owned
-python3.11 - "$STATE_DIR/guard-paused" <<'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-epoch, header, checkpoints = p.read_bytes().split(b'\n', 2)
-fields = header.split()
-p.write_bytes(epoch + b'\nsource-v1 ' + fields[2] + b' ' + fields[3] + b'\n' + checkpoints)
-PY
+proof_header="$(/usr/bin/sed -n '2p' "$STATE_DIR/guard-paused")"
+IFS=' ' read -r proof_version proof_source_key proof_identity proof_size proof_event_time \
+  <<< "$proof_header"
+v1_state="$TEST_ROOT/guard-paused.source-v1"
+{
+  /usr/bin/head -n 1 "$STATE_DIR/guard-paused"
+  print -r -- "source-v1 $proof_identity $proof_size"
+  /usr/bin/tail -n +3 "$STATE_DIR/guard-paused"
+} > "$v1_state"
+mv -f "$v1_state" "$STATE_DIR/guard-paused"
 mv -f "$GFN_DIR/debug.log" "$GFN_DIR/debug.log.bak"
 print 'new debug generation' > "$GFN_DIR/debug.log"
 run_once 11481
@@ -267,12 +269,8 @@ env HOME="$FIXTURE_HOME" ARQ_GFN_ARQC="$TEST_ROOT/arqc" \
 monitor_pid=$!
 sleep 2
 debug_event 30 STARTED >> "$GFN_DIR/debug.log"
-python3.11 - "$GFN_DIR/debug.log" <<'PY'
-from pathlib import Path
-import sys
-with Path(sys.argv[1]).open('ab') as f:
-    f.write(b'unrelated diagnostic entry\n' * 50000)
-PY
+/usr/bin/awk 'BEGIN { for (i = 0; i < 50000; i++) print "unrelated diagnostic entry" }' \
+  >> "$GFN_DIR/debug.log"
 wait_call 'pauseBackups 10'
 kill "$monitor_pid"
 wait "$monitor_pid" 2>/dev/null || true

@@ -39,6 +39,8 @@ Error alerts are independent of ordinary notifications. Missing sources or an un
 
 Session events come from `debug.log` and `console.log` in `~/Library/Application Support/NVIDIA/GeForceNOW/`, verified locally with GFN 2.0.87 and 2.0.88. The smaller `debug.log` contains `IPC_STREAMING_PREPARE/STARTING/SESSION_SETUP/STARTED_EVENT` and `IPC_STREAMING_TERMINATED/MODE_EXIT_EVENT`. The alternative `console.log` contains `Loading` / `Streaming` and `PostSessionConnection` / `PostStreaming` / `Done`. Selection considers event time so a stale file cannot mask a newer session in another file. In the local 2.0.88 installation, the old `logs/gfn_reliability_monitor.log` and `logs/gameStreamClientAgent.log` lacked the new session, so neither is an automatic fallback. When running the script directly, `ARQ_GFN_LOG_FILE` restricts reading to the explicitly selected file; legacy format remains supported.
 
+When a verified append moves event timestamps backwards, the guard uses that source until the GFN process exits instead of comparing it with the other file’s old clock. This choice survives a restart with an owned pause. Losing that source raises an alert and preserves the owned pause. A clock change before the guard starts cannot be reliably inferred from logs without time zones. After an observed GFN exit, old start events cannot pause backups again merely because the launcher reopens.
+
 **Why a persistent two-second check instead of `launchd` `WatchPaths`?**
 
 An earlier `WatchPaths` version was more elegant on paper, but macOS coalesced or delayed events enough to postpone both pause and resume. The current idle fast path does not parse the log or call `pgrep`: it checks both file signatures with `zsh/stat` and small byte checkpoints with `zsh/system`, followed by `zselect` sleep. `tail`, `awk`, the process check, and the wall-clock read run only after a log change or during the 60-second safety reconciliation.
@@ -123,7 +125,7 @@ ARQ_GFN_LOOP_SECONDS=5 ./install.sh
 |---|---|
 | `arq-gfn-guard.sh` | `~/Library/Application Support/ArqGFNGuard/arq-gfn-guard.sh` |
 | `com.local.arq-gfn-guard.plist` | `~/Library/LaunchAgents/com.local.arq-gfn-guard.plist` *(rendered by the installer)* |
-| *(generated at runtime)* | `~/Library/Application Support/ArqGFNGuard/guard-paused` and `guard-alert` |
+| *(generated at runtime)* | `~/Library/Application Support/ArqGFNGuard/guard-paused` and `guard-alert-detection`, `guard-alert-action` |
 | *(generated at runtime)* | `~/Library/Logs/ArqGFNGuard/guard.log` |
 | *(launchd output)* | `~/Library/Logs/ArqGFNGuard/launchd.out.log` and `launchd.err.log` |
 
@@ -132,9 +134,11 @@ ARQ_GFN_LOOP_SECONDS=5 ./install.sh
 The suite uses isolated temporary logs and state plus fake `arqc`, clock, process-query, and notification boundaries. It never pauses the real Arq installation.
 
 ```bash
-zsh -n arq-gfn-guard.sh install.sh uninstall.sh tests/test_guard.zsh
+for script_file in arq-gfn-guard.sh install.sh uninstall.sh tests/*.zsh; do zsh -n "$script_file" || break; done
 zsh tests/test_guard.zsh
 zsh tests/test_sources.zsh
+zsh tests/test_source_edges.zsh
+zsh tests/test_alert_edges.zsh
 plutil -lint com.local.arq-gfn-guard.plist
 ```
 

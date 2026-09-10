@@ -138,52 +138,137 @@ notify_user() {
     -e 'end run' -- "$message_text" >/dev/null 2>&1 || true
 }
 
-alert_episode_kind=""
-alert_episode_started=0
-alert_episode_notified=0
+readonly ALERT_DETECTION_STATE_FILE="$STATE_DIR/guard-alert-detection"
+readonly ALERT_ACTION_STATE_FILE="$STATE_DIR/guard-alert-action"
+detection_alert_kind=""
+detection_alert_started=0
+detection_alert_notified=0
+action_alert_kind=""
+action_alert_started=0
+action_alert_notified=0
 
-write_alert_episode() {
-  local temporary_alert
+write_alert_slot() {
+  local slot_name="$1"
+  local temporary_alert alert_state_path
+  local slot_kind slot_started slot_notified
+  case "$slot_name" in
+    detection)
+      alert_state_path="$ALERT_DETECTION_STATE_FILE"
+      slot_kind="$detection_alert_kind"
+      slot_started="$detection_alert_started"
+      slot_notified="$detection_alert_notified"
+      ;;
+    action)
+      alert_state_path="$ALERT_ACTION_STATE_FILE"
+      slot_kind="$action_alert_kind"
+      slot_started="$action_alert_started"
+      slot_notified="$action_alert_notified"
+      ;;
+    *) return 1 ;;
+  esac
   temporary_alert="$(/usr/bin/mktemp "$STATE_DIR/.guard-alert.XXXXXX")" || return 1
-  if ! print -r -- "$alert_episode_kind $alert_episode_started $alert_episode_notified" > "$temporary_alert"; then
+  if ! print -r -- "$slot_kind $slot_started $slot_notified" > "$temporary_alert"; then
     rm -f "$temporary_alert"
     return 1
   fi
   chmod 600 "$temporary_alert" 2>/dev/null || true
-  if ! mv -f "$temporary_alert" "$ALERT_STATE_FILE"; then
+  if ! mv -f "$temporary_alert" "$alert_state_path"; then
     rm -f "$temporary_alert"
     return 1
   fi
 }
 
-restore_alert_episode() {
-  local saved_kind saved_start saved_notified extra
-  [[ -f "$ALERT_STATE_FILE" ]] || return 0
-  IFS=' ' read -r saved_kind saved_start saved_notified extra < "$ALERT_STATE_FILE" || return 0
+restore_alert_slot() {
+  local slot_name="$1"
+  local alert_state_path saved_kind saved_start saved_notified extra
+  case "$slot_name" in
+    detection) alert_state_path="$ALERT_DETECTION_STATE_FILE" ;;
+    action) alert_state_path="$ALERT_ACTION_STATE_FILE" ;;
+    *) return 1 ;;
+  esac
+  [[ -f "$alert_state_path" ]] || return 0
+  IFS=' ' read -r saved_kind saved_start saved_notified extra < "$alert_state_path" || return 0
   [[ "$saved_kind" =~ ^[a-z0-9-]+$ \
      && "$saved_start" =~ ^[0-9]+$ && ${#saved_start} -le 18 \
      && ( "$saved_notified" == 0 || "$saved_notified" == 1 ) && -z "$extra" ]] || return 0
-  alert_episode_kind="$saved_kind"
-  alert_episode_started="$saved_start"
-  alert_episode_notified="$saved_notified"
+  if [[ "$slot_name" == detection ]]; then
+    detection_alert_kind="$saved_kind"
+    detection_alert_started="$saved_start"
+    detection_alert_notified="$saved_notified"
+  else
+    action_alert_kind="$saved_kind"
+    action_alert_started="$saved_start"
+    action_alert_notified="$saved_notified"
+  fi
+}
+
+restore_alert_episode() {
+  restore_alert_slot detection
+  restore_alert_slot action
+  # Migrate the single-slot format written by older guards. Remove it only
+  # after the replacement slot is safely written, so an interrupted upgrade
+  # can retry from the legacy record.
+  if [[ -f "$ALERT_STATE_FILE" ]] \
+      && [[ -z "$detection_alert_kind" && -z "$action_alert_kind" ]]; then
+    local saved_kind saved_start saved_notified extra
+    IFS=' ' read -r saved_kind saved_start saved_notified extra < "$ALERT_STATE_FILE" || return 0
+    [[ "$saved_kind" =~ ^[a-z0-9-]+$ \
+       && "$saved_start" =~ ^[0-9]+$ && ${#saved_start} -le 18 \
+       && ( "$saved_notified" == 0 || "$saved_notified" == 1 ) && -z "$extra" ]] || return 0
+    case "$saved_kind" in
+      gfn-log-*)
+        detection_alert_kind="$saved_kind"
+        detection_alert_started="$saved_start"
+        detection_alert_notified="$saved_notified"
+        if write_alert_slot detection; then
+          rm -f "$ALERT_STATE_FILE" 2>/dev/null || true
+        fi
+        ;;
+      *)
+        action_alert_kind="$saved_kind"
+        action_alert_started="$saved_start"
+        action_alert_notified="$saved_notified"
+        if write_alert_slot action; then
+          rm -f "$ALERT_STATE_FILE" 2>/dev/null || true
+        fi
+        ;;
+    esac
+  fi
+}
+
+clear_alert_slot() {
+  local slot_name="$1"
+  case "$slot_name" in
+    detection)
+      detection_alert_kind=""
+      detection_alert_started=0
+      detection_alert_notified=0
+      rm -f "$ALERT_DETECTION_STATE_FILE" 2>/dev/null || true
+      ;;
+    action)
+      action_alert_kind=""
+      action_alert_started=0
+      action_alert_notified=0
+      rm -f "$ALERT_ACTION_STATE_FILE" 2>/dev/null || true
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 clear_alert_episode() {
-  alert_episode_kind=""
-  alert_episode_started=0
-  alert_episode_notified=0
+  clear_alert_slot detection
+  clear_alert_slot action
   rm -f "$ALERT_STATE_FILE" 2>/dev/null || true
 }
 
 clear_detection_alert() {
-  case "$alert_episode_kind" in
-    gfn-log-*) clear_alert_episode ;;
-  esac
+  [[ "$detection_alert_kind" == gfn-log-* ]] || return 0
+  clear_alert_slot detection
 }
 
 clear_action_alert() {
-  case "$alert_episode_kind" in
-    pause-failure|resume-failure|state-save-failure) clear_alert_episode ;;
+  case "$action_alert_kind" in
+    pause-failure|resume-failure|state-save-failure) clear_alert_slot action ;;
   esac
 }
 
@@ -219,20 +304,46 @@ raise_alert() {
   local english_message="$3"
   local polish_message="$4"
   local immediate="${5:-0}"
-  if [[ "$alert_episode_kind" != "$kind" ]]; then
-    alert_episode_kind="$kind"
-    alert_episode_started="$now_epoch"
-    alert_episode_notified=0
-    log_message "WARN: $english_message"
-    write_alert_episode || log_message "WARN: could not persist alert episode"
+  local slot_name slot_kind slot_started slot_notified
+  if [[ "$kind" == gfn-log-* ]]; then
+    slot_name=detection
+    slot_kind="$detection_alert_kind"
+    slot_started="$detection_alert_started"
+    slot_notified="$detection_alert_notified"
+  else
+    slot_name=action
+    slot_kind="$action_alert_kind"
+    slot_started="$action_alert_started"
+    slot_notified="$action_alert_notified"
   fi
-  if (( ! immediate && now_epoch - alert_episode_started < ALERT_DELAY_SECONDS )); then
+  if [[ "$slot_kind" != "$kind" ]] || (( slot_started > now_epoch )); then
+    slot_kind="$kind"
+    slot_started="$now_epoch"
+    slot_notified=0
+    if [[ "$slot_name" == detection ]]; then
+      detection_alert_kind="$slot_kind"
+      detection_alert_started="$slot_started"
+      detection_alert_notified="$slot_notified"
+    else
+      action_alert_kind="$slot_kind"
+      action_alert_started="$slot_started"
+      action_alert_notified="$slot_notified"
+    fi
+    log_message "WARN: $english_message"
+    write_alert_slot "$slot_name" || log_message "WARN: could not persist alert episode"
+  fi
+  if (( ! immediate && now_epoch - slot_started < ALERT_DELAY_SECONDS )); then
     return 0
   fi
-  (( alert_episode_notified )) && return 0
+  (( slot_notified )) && return 0
   if notify_error "$english_message" "$polish_message"; then
-    alert_episode_notified=1
-    write_alert_episode || log_message "WARN: could not persist alert notification state"
+    slot_notified=1
+    if [[ "$slot_name" == detection ]]; then
+      detection_alert_notified="$slot_notified"
+    else
+      action_alert_notified="$slot_notified"
+    fi
+    write_alert_slot "$slot_name" || log_message "WARN: could not persist alert notification state"
   fi
 }
 
@@ -308,8 +419,9 @@ parse_stream_evidence() {
   ' "$@"
 }
 
-# Parsed state is process-local. The lease persists only source evidence so
-# restart recovery can identify its rotated log, never assume an active state.
+# The lease records a successful owned pause and its source evidence. After
+# restart, that evidence can authenticate a rotated log; unrelated backups
+# cannot establish whether the owned session ended.
 parsed_signature=""
 parsed_identity=""
 parsed_size=0
@@ -337,6 +449,12 @@ GFN_LOG_SOURCE_KEY=""
 selected_source_has_evidence=0
 selected_source_available=0
 selected_source_untrusted=0
+selected_source_suppressed=0
+stopped_debug_evidence=""
+stopped_console_evidence=""
+stopped_explicit_signature=""
+clock_source_key=""
+clock_source_dirty=0
 
 # Compare small byte checkpoints before trusting append-only growth. Reading
 # at the OLD size detects copytruncate/regrowth without scanning the prefix.
@@ -364,8 +482,10 @@ log_checkpoint() {
 
 trusted_rotated_evidence() {
   local backup_file="$1.bak" backup_identity backup_size
+  local proof_identity="${2-$parsed_identity}" proof_size="${3-$parsed_size}"
+  local proof_prefix="${4-$parsed_prefix}" proof_suffix="${5-$parsed_suffix}"
   trusted_evidence_out=""
-  [[ -n "$parsed_identity" ]] || return 0
+  [[ -n "$proof_identity" ]] || return 0
   log_signature "$backup_file"
   [[ "$log_signature_out" != missing && "$log_signature_out" != unreadable ]] || return 0
   backup_identity="${log_signature_out%:*}"
@@ -373,11 +493,11 @@ trusted_rotated_evidence() {
   backup_size="${log_signature_out##*:}"
   # Only the prior inode or matching nonempty byte checkpoints prove that
   # this backup belongs to the source whose session we already observed.
-  if [[ "$backup_identity" == "$parsed_identity" ]] \
-      || { (( parsed_size > 0 && backup_size >= parsed_size )) \
-           && log_checkpoint "$parsed_size" "$backup_file" \
-           && [[ "$checkpoint_prefix_out" == "$parsed_prefix" \
-              && "$checkpoint_suffix_out" == "$parsed_suffix" ]]; }; then
+  if [[ "$backup_identity" == "$proof_identity" ]] \
+      || { (( proof_size > 0 && backup_size >= proof_size )) \
+           && log_checkpoint "$proof_size" "$backup_file" \
+           && [[ "$checkpoint_prefix_out" == "$proof_prefix" \
+              && "$checkpoint_suffix_out" == "$proof_suffix" ]]; }; then
     trusted_evidence_out="$(parse_stream_evidence "$backup_file" 2>/dev/null)" || trusted_evidence_out=""
   fi
 }
@@ -387,6 +507,10 @@ latest_stream_state() {
   local source_signature="$1"
   local source_key="${GFN_LOG_SOURCE_KEY:-explicit}"
   detected_stream_state_out=""
+  if (( selected_source_suppressed )) \
+      || [[ -n "$GFN_LOG_OVERRIDE" && "$source_signature" == "$stopped_explicit_signature" ]]; then
+    return 0
+  fi
   [[ -f "$GFN_LOG_FILE" && "$source_signature" != missing \
       && "$source_signature" != unreadable ]] || {
     parsed_signature=""
@@ -423,10 +547,21 @@ latest_stream_state() {
   fi
 
   source_proof_ready=0
-  evidence="$(/usr/bin/tail -c "$LOG_SCAN_BYTES" "$GFN_LOG_FILE" 2>/dev/null | parse_stream_evidence)" || return 0
+  if [[ -z "$GFN_LOG_OVERRIDE" ]]; then
+    # The selector already validated this source, including its own rotated
+    # backup. Reuse that evidence rather than reparsing against another file's
+    # selected checkpoint or reading the same log twice.
+    if [[ "$source_key" == debug ]]; then
+      evidence="$debug_candidate_state"$'\t'"$debug_candidate_time"
+    else
+      evidence="$console_candidate_state"$'\t'"$console_candidate_time"
+    fi
+  else
+    evidence="$(/usr/bin/tail -c "$LOG_SCAN_BYTES" "$GFN_LOG_FILE" 2>/dev/null | parse_stream_evidence)" || return 0
+  fi
   detected_state="${evidence%%$'\t'*}"
   detected_event_time="${evidence#*$'\t'}"
-  if [[ -z "$detected_state" ]] && (( recover )); then
+  if [[ -z "$detected_state" && -n "$GFN_LOG_OVERRIDE" ]] && (( recover )); then
     # Full scans are for startup, rotation/truncation, and unseen bursts that
     # could have pushed an end outside the tail. Ordinary appends retain the
     # last parsed state instead of repeatedly scanning the entire file.
@@ -440,7 +575,7 @@ latest_stream_state() {
   # that marker is not evidence that this lease ended. Keep the lease alive;
   # the normal missing/unknown alert tells the user that the source is gone.
   selected_source_untrusted=0
-  if [[ "$previous_source_key" != "$source_key" ]] \
+  if [[ "$previous_source_key" != "$source_key" && "$clock_source_key" != "$source_key" ]] \
       && [[ "$previous_source_key" != legacy || "$source_identity" != "$parsed_identity" ]] \
       && [[ "$parsed_stream_state" == active ]] \
       && [[ "$detected_state" == inactive ]]; then
@@ -563,6 +698,14 @@ candidate_evidence() {
   fi
   # Selection must consider a proven rotated event before choosing an older
   # marker in the alternate source. Unknown backups remain ineligible.
+  if [[ -z "$candidate_state" && "$previous_identity" == *:* ]]; then
+    trusted_rotated_evidence "$source_file" "$previous_identity" "$previous_size" \
+      "$previous_prefix" "$previous_suffix"
+    if [[ -n "$trusted_evidence_out" ]]; then
+      candidate_state="${trusted_evidence_out%%$'\t'*}"
+      candidate_time="${trusted_evidence_out#*$'\t'}"
+    fi
+  fi
   if [[ -z "$candidate_state" ]] \
       && { [[ "$source_file" == "$GFN_DEBUG_LOG" && "$parsed_source_key" == debug ]] \
         || [[ "$source_file" == "$GFN_CONSOLE_LOG" && "$parsed_source_key" == console ]]; }; then
@@ -571,6 +714,16 @@ candidate_evidence() {
       candidate_state="${trusted_evidence_out%%$'\t'*}"
       candidate_time="${trusted_evidence_out#*$'\t'}"
     fi
+  fi
+  # A backwards timestamp in a verified append establishes a new local-clock
+  # epoch. Keep using that observed source until the process exits; comparing
+  # it with the other file's old wall clock would resurrect stale evidence.
+  if (( same_source )) && [[ "$candidate_time" =~ ^[0-9]{17}$ \
+      && "$previous_time" =~ ^[0-9]{17}$ && "x$candidate_time" < "x$previous_time" ]]; then
+    local observed_clock_key=console
+    [[ "$source_file" == "$GFN_DEBUG_LOG" ]] && observed_clock_key=debug
+    [[ "$clock_source_key" == "$observed_clock_key" ]] || clock_source_dirty=1
+    clock_source_key="$observed_clock_key"
   fi
   candidate_state_out="$candidate_state"
   candidate_time_out="$candidate_time"
@@ -582,7 +735,9 @@ candidate_evidence() {
 
 select_log_source() {
   local debug_signature console_signature selected_signature selected_state
+  local debug_state console_state
   local debug_available=0 console_available=0
+  selected_source_suppressed=0
 
   if [[ -n "$GFN_LOG_OVERRIDE" ]]; then
     GFN_LOG_FILE="$GFN_LOG_OVERRIDE"
@@ -620,32 +775,43 @@ select_log_source() {
   console_candidate_suffix="$candidate_suffix_out"
   console_candidate_signature="$console_signature"
 
+  # Old active events belong to the process observed before it stopped.
+  # Unrelated appends or a launcher-only reopen do not create a new session.
+  debug_state="$debug_candidate_state"
+  console_state="$console_candidate_state"
+  if [[ "$debug_state" == active && "$debug_state|$debug_candidate_time" == "$stopped_debug_evidence" ]]; then
+    debug_state=""
+  fi
+  if [[ "$console_state" == active && "$console_state|$console_candidate_time" == "$stopped_console_evidence" ]]; then
+    console_state=""
+  fi
+
   [[ "$debug_signature" == missing || "$debug_signature" == unreadable ]] \
     || debug_available=1
   [[ "$console_signature" == missing || "$console_signature" == unreadable ]] \
     || console_available=1
 
   selected_signature="$debug_signature"
-  selected_state="$debug_candidate_state"
+  selected_state="$debug_state"
   GFN_LOG_FILE="$GFN_DEBUG_LOG"
   GFN_LOG_SOURCE_KEY="debug"
   if (( !debug_available )) && (( console_available )); then
     selected_signature="$console_signature"
-    selected_state="$console_candidate_state"
+    selected_state="$console_state"
     GFN_LOG_FILE="$GFN_CONSOLE_LOG"
     GFN_LOG_SOURCE_KEY="console"
   elif (( debug_available && console_available )); then
-    if [[ -n "$console_candidate_state" && -z "$debug_candidate_state" ]]; then
+    if [[ -n "$console_state" && -z "$debug_state" ]]; then
       selected_signature="$console_signature"
-      selected_state="$console_candidate_state"
+      selected_state="$console_state"
       GFN_LOG_FILE="$GFN_CONSOLE_LOG"
       GFN_LOG_SOURCE_KEY="console"
-    elif [[ -n "$console_candidate_state" && -n "$debug_candidate_state" ]]; then
+    elif [[ -n "$console_state" && -n "$debug_state" ]]; then
       if [[ -n "$console_candidate_time" && -z "$debug_candidate_time" ]] \
           || [[ -n "$console_candidate_time" && -n "$debug_candidate_time" \
              && "x$console_candidate_time" > "x$debug_candidate_time" ]]; then
         selected_signature="$console_signature"
-        selected_state="$console_candidate_state"
+        selected_state="$console_state"
         GFN_LOG_FILE="$GFN_CONSOLE_LOG"
         GFN_LOG_SOURCE_KEY="console"
       fi
@@ -654,10 +820,27 @@ select_log_source() {
     selected_signature="missing"
   fi
 
+  if [[ "$clock_source_key" == debug ]]; then
+    GFN_LOG_FILE="$GFN_DEBUG_LOG"
+    GFN_LOG_SOURCE_KEY=debug
+    selected_state="$debug_state"
+    selected_signature="$debug_signature"
+  elif [[ "$clock_source_key" == console ]]; then
+    GFN_LOG_FILE="$GFN_CONSOLE_LOG"
+    GFN_LOG_SOURCE_KEY=console
+    selected_state="$console_state"
+    selected_signature="$console_signature"
+  fi
   selected_source_available=0
-  (( debug_available || console_available )) && selected_source_available=1
+  [[ "$selected_signature" == missing || "$selected_signature" == unreadable ]] \
+    || selected_source_available=1
   selected_source_has_evidence=0
   [[ -n "$selected_state" ]] && selected_source_has_evidence=1
+  if [[ -z "$selected_state" ]] \
+      && { [[ "$GFN_LOG_SOURCE_KEY" == debug && "$debug_candidate_state" == active ]] \
+        || [[ "$GFN_LOG_SOURCE_KEY" == console && "$console_candidate_state" == active ]]; }; then
+    selected_source_suppressed=1
+  fi
   selected_source_untrusted=0
 }
 
@@ -676,12 +859,12 @@ read_state_timestamp() {
 # header and two raw byte checkpoints follow; no stored text is evaluated.
 restore_source_checkpoint() {
   [[ "$has_system" == true && -f "$STATE_FILE" ]] || return 1
-  local proof_fd saved_epoch proof_version proof_source_key proof_identity proof_size proof_event_time extra
+  local proof_fd saved_epoch proof_version proof_source_key proof_identity proof_size proof_event_time proof_clock_key extra
   local prefix_data="" suffix_data="" chunk_size bytes_read legacy_proof=0
   { exec {proof_fd}< "$STATE_FILE"; } 2>/dev/null || return 1
   {
     IFS= read -r -u "$proof_fd" saved_epoch || return 1
-    IFS=' ' read -r -u "$proof_fd" proof_version proof_source_key proof_identity proof_size proof_event_time extra || return 1
+    IFS=' ' read -r -u "$proof_fd" proof_version proof_source_key proof_identity proof_size proof_event_time proof_clock_key extra || return 1
     [[ "$saved_epoch" =~ ^[0-9]+$ && ${#saved_epoch} -le 18 ]] || return 1
     if [[ "$proof_version" == source-v1 ]]; then
       # Old state has no source path or event watermark. It remains usable for
@@ -691,12 +874,17 @@ restore_source_checkpoint() {
       proof_identity="$proof_source_key"
       proof_source_key="legacy"
       proof_event_time="-"
-    elif [[ "$proof_version" == source-v2 \
+    elif [[ ( "$proof_version" == source-v2 || "$proof_version" == source-v3 ) \
        && "$proof_source_key" =~ ^[A-Za-z0-9_.-]+$ \
        && "$proof_identity" =~ ^[0-9]{1,18}:[0-9]{1,18}$ \
        && "$proof_size" =~ ^[0-9]+$ && ${#proof_size} -le 18 \
        && ( "$proof_event_time" == - || "$proof_event_time" =~ ^[0-9]{17}$ ) \
        && -z "$extra" ]]; then
+      if [[ "$proof_version" == source-v3 ]]; then
+        [[ "$proof_clock_key" == - || "$proof_clock_key" == debug || "$proof_clock_key" == console ]] || return 1
+      else
+        [[ -z "$proof_clock_key" ]] || return 1
+      fi
       legacy_proof=0
     else
       return 1
@@ -712,6 +900,9 @@ restore_source_checkpoint() {
       (( bytes_read == chunk_size )) || return 1
       sysread -i "$proof_fd" -s "$chunk_size" -c bytes_read suffix_data || return 1
       (( bytes_read == chunk_size )) || return 1
+    fi
+    if [[ "$proof_version" == source-v3 && "$proof_clock_key" != - ]]; then
+      clock_source_key="$proof_clock_key"
     fi
     parsed_identity="$proof_identity"
     parsed_size="$proof_size"
@@ -742,7 +933,7 @@ write_state_timestamp() {
       if (( source_proof_ready )) && [[ -n "$parsed_signature" \
           && -n "$GFN_LOG_SOURCE_KEY" \
           && ( "$parsed_event_time" == - || "$parsed_event_time" =~ ^[0-9]{17}$ ) ]]; then
-        print -r -- "source-v2 $GFN_LOG_SOURCE_KEY $parsed_identity $parsed_size $parsed_event_time" \
+        print -r -- "source-v3 $GFN_LOG_SOURCE_KEY $parsed_identity $parsed_size $parsed_event_time ${clock_source_key:--}" \
           && print -rn -- "$parsed_prefix$parsed_suffix"
       elif [[ -f "$STATE_FILE" ]]; then
         # Keep the last proven source while rotation hides current events.
@@ -835,6 +1026,11 @@ reconcile_backup_state() {
   else
     # Do not carry old stream evidence into a new launcher process after
     # a crash/quit. Its startup rotation may retain an old active .bak.
+    clock_source_key=""
+    clock_source_dirty=0
+    stopped_debug_evidence="$debug_candidate_state|$debug_candidate_time"
+    stopped_console_evidence="$console_candidate_state|$console_candidate_time"
+    stopped_explicit_signature="$source_signature"
     parsed_signature=""
     parsed_identity=""
     parsed_size=0
@@ -860,9 +1056,13 @@ reconcile_backup_state() {
       first_pause=1
     fi
 
+    # Persist an observed clock-source change immediately with a renewed
+    # lease; waiting four minutes would lose this ordering proof on restart.
+    (( clock_source_dirty )) && previous_renewal=0
     if (( now_epoch - previous_renewal >= RENEW_SECONDS )); then
       if run_arqc pauseBackups "$PAUSE_MINUTES"; then
         if write_state_timestamp "$now_epoch"; then
+          clock_source_dirty=0
           clear_action_alert
           log_message "GFN stream active; Arq pause renewed for $PAUSE_MINUTES minutes"
           if (( first_pause )); then
