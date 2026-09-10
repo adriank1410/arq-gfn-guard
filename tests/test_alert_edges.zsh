@@ -28,9 +28,10 @@ console_event() {
 run_once() {
   local now_epoch="$1"
   local delay_seconds="$2"
+  local force_process="${3:-1}"
   env ARQ_GFN_ARQC="$TEST_ROOT/arqc" ARQ_GFN_LOG_FILE="$LOG_FILE" \
     ARQ_GFN_STATE_DIR="$STATE_DIR" ARQ_GFN_GUARD_LOG="$TEST_ROOT/guard.log" \
-    ARQ_GFN_FORCE_PROCESS=1 ARQ_GFN_NOW="$now_epoch" \
+    ARQ_GFN_FORCE_PROCESS="$force_process" ARQ_GFN_NOW="$now_epoch" \
     ARQ_GFN_NOTIFICATIONS=0 ARQ_GFN_ERROR_NOTIFICATIONS=1 \
     ARQ_GFN_LANG=en ARQ_GFN_ALERT_DELAY_SECONDS="$delay_seconds" \
     ARQ_GFN_GUARD_ONCE=1 "$TEST_ROOT/guard"
@@ -102,4 +103,31 @@ console_event 50 Streaming > "$LOG_FILE"
 : > "$ALERTS"
 TEST_ARQC_EXIT=42 run_once 5160 0
 [[ "$(wc -l < "$ALERTS" | tr -d ' ')" == 1 ]] || { print -u2 'Next failed session did not notify'; exit 1; }
-print -r -- 'All alert edge tests passed' 
+
+# An indeterminate process probe must produce a delayed diagnostic even when
+# the explicit log source is missing, without claiming that GFN is running.
+rm -f "$STATE_DIR/guard-paused" "$STATE_DIR/guard-alert-detection" \
+  "$STATE_DIR/guard-alert-action" "$STATE_DIR/guard-alert" "$LOG_FILE"
+: > "$ALERTS"
+run_once 6000 60 invalid
+[[ ! -s "$ALERTS" ]] || { print -u2 'Unknown process alerted before grace'; exit 1; }
+run_once 6060 60 invalid
+[[ "$(wc -l < "$ALERTS" | tr -d ' ')" == 1 ]] \
+  || { print -u2 'Unknown process did not notify after grace'; exit 1; }
+grep -Fq 'Could not determine whether GeForce NOW is running; session protection is unavailable.' "$ALERTS" \
+  || { print -u2 'Unknown process notification used the wrong message'; exit 1; }
+
+# A later authoritative inactive state clears the unknown-process episode.
+console_event 60 Done > "$LOG_FILE"
+run_once 6070 60 1
+[[ ! -f "$STATE_DIR/guard-alert-detection" ]] \
+  || { print -u2 'Unknown-process alert did not recover'; exit 1; }
+# Corrupt clock metadata must surface a diagnostic without stopping the guard.
+: > "$ALERTS"
+print -r -- 'corrupt clock metadata' > "$STATE_DIR/guard-clock"
+run_once 6080 0 1
+[[ "$(wc -l < "$ALERTS" | tr -d ' ')" == 1 ]] \
+  || { print -u2 'Corrupt clock metadata did not notify'; exit 1; }
+grep -Fq 'GFN clock recovery state could not be read or saved' "$ALERTS" \
+  || { print -u2 'Clock metadata failure used the wrong message'; exit 1; }
+print -r -- 'All alert edge tests passed'

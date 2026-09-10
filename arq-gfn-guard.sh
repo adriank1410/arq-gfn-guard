@@ -9,6 +9,7 @@ export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 readonly ARQC="${ARQ_GFN_ARQC:-/Applications/Arq.app/Contents/Resources/arqc}"
 readonly STATE_DIR="${ARQ_GFN_STATE_DIR:-$HOME/Library/Application Support/ArqGFNGuard}"
 readonly STATE_FILE="$STATE_DIR/guard-paused"
+readonly CLOCK_STATE_FILE="$STATE_DIR/guard-clock"
 readonly ALERT_STATE_FILE="$STATE_DIR/guard-alert"
 readonly GUARD_LOG="${ARQ_GFN_GUARD_LOG:-$HOME/Library/Logs/ArqGFNGuard/guard.log}"
 readonly PAUSE_MINUTES=10
@@ -466,6 +467,65 @@ clock_source_key=""
 clock_source_dirty=0
 clock_debug_baseline=""
 clock_console_baseline=""
+clock_saved_snapshot=""
+clock_failure_logged=0
+clock_failure_notified=0
+
+clock_state_failure() {
+  if (( ! clock_failure_logged )); then
+    log_message "ERROR: could not read or save GFN clock recovery state"
+    clock_failure_logged=1
+  fi
+  if (( ! clock_failure_notified )) && notify_error \
+      "GFN clock recovery state could not be read or saved; detection after a restart may be unreliable." \
+      "Nie można odczytać lub zapisać stanu zegara GFN; wykrywanie sesji po restarcie może być niepewne."; then
+    clock_failure_notified=1
+  fi
+  return 1
+}
+
+restore_clock_state() {
+  [[ -e "$CLOCK_STATE_FILE" || -L "$CLOCK_STATE_FILE" ]] || return 0
+  local version saved_key saved_debug saved_console extra
+  local baseline_pattern='^(active|inactive)?[|]([0-9]{17})?$'
+  if [[ ! -f "$CLOCK_STATE_FILE" ]] \
+      || ! IFS=' ' read -r version saved_key saved_debug saved_console extra < "$CLOCK_STATE_FILE"; then
+    clock_state_failure
+    return 1
+  fi
+  if [[ "$version" != clock-v1 || -n "$extra" ]] \
+      || [[ "$saved_key" != - && "$saved_key" != debug && "$saved_key" != console ]] \
+      || [[ "$saved_debug" != - && ! "$saved_debug" =~ "$baseline_pattern" ]] \
+      || [[ "$saved_console" != - && ! "$saved_console" =~ "$baseline_pattern" ]]; then
+    clock_state_failure
+    return 1
+  fi
+  clock_source_key="${saved_key/-/}"
+  clock_debug_baseline="${saved_debug/-/}"
+  clock_console_baseline="${saved_console/-/}"
+  clock_saved_snapshot="clock-v1 $saved_key $saved_debug $saved_console"
+}
+
+write_clock_state() {
+  local snapshot="clock-v1 ${clock_source_key:--} ${clock_debug_baseline:--} ${clock_console_baseline:--}"
+  local temporary_clock=""
+  # No file is needed until a clock episode occurs. Unlike guard-paused, this
+  # history survives a successful resume and protects launcher-only restarts.
+  [[ -n "$clock_source_key$clock_debug_baseline$clock_console_baseline$clock_saved_snapshot" ]] || return 0
+  [[ "$snapshot" == "$clock_saved_snapshot" && -f "$CLOCK_STATE_FILE" ]] && return 0
+  temporary_clock="$(/usr/bin/mktemp "$STATE_DIR/.guard-clock.XXXXXX")" || temporary_clock=""
+  if [[ -n "$temporary_clock" && ! -d "$CLOCK_STATE_FILE" ]] \
+      && print -r -- "$snapshot" > "$temporary_clock" \
+      && chmod 600 "$temporary_clock" \
+      && mv -f "$temporary_clock" "$CLOCK_STATE_FILE"; then
+    clock_saved_snapshot="$snapshot"
+    clock_failure_logged=0
+    clock_failure_notified=0
+    return 0
+  fi
+  [[ -z "$temporary_clock" ]] || rm -f "$temporary_clock"
+  clock_state_failure
+}
 
 # Compare small byte checkpoints before trusting append-only growth. Reading
 # at the OLD size detects copytruncate/regrowth without scanning the prefix.
@@ -1057,6 +1117,15 @@ reconcile_backup_state() {
         || [[ -f "$STATE_FILE" && "$detected_stream_state" != "inactive" ]]; then
       current_stream_state="active"
     fi
+    if (( selected_source_untrusted )) || (( !selected_source_available )) \
+        || (( !selected_source_has_evidence )); then
+      raise_alert "gfn-log-process-unknown" "$now_epoch" \
+        "Could not determine whether GeForce NOW is running; session protection is unavailable." \
+        "Nie udało się ustalić, czy GeForce NOW działa; ochrona sesji jest niedostępna."
+    elif [[ "$detected_stream_state" == inactive \
+        || "$detected_stream_state" == active ]]; then
+      clear_detection_alert
+    fi
   else
     # Do not carry old stream evidence into a new launcher process after
     # a crash/quit. Its startup rotation may retain an old active .bak.
@@ -1093,6 +1162,8 @@ reconcile_backup_state() {
     clock_source_key=""
     clock_source_dirty=0
   fi
+
+  write_clock_state || true
 
   if [[ "$current_stream_state" == "active" ]]; then
     if [[ -f "$STATE_FILE" ]]; then
@@ -1190,6 +1261,7 @@ guard_sleep() {
 }
 
 restore_source_checkpoint || true
+restore_clock_state || true
 restore_alert_episode
 
 last_signature=""

@@ -15,6 +15,8 @@ SH
 cat > "$ROOT/arqc" <<'SH'
 #!/bin/zsh
 print -r -- "$*" >> "$TEST_CALLS"
+if [[ "$1" == resumeBackups && -f "${TEST_CALLS:h}/fail-resume" ]]; then exit 42; fi
+exit 0
 SH
 chmod +x "$ROOT/pgrep" "$ROOT/arqc"
 sed "s#/usr/bin/pgrep#$ROOT/pgrep#g" "$REPO/arq-gfn-guard.sh" > "$ROOT/guard"
@@ -85,6 +87,14 @@ sleep 2
 console_event 01:05:00 Streaming >> "$LOGS/console.log"
 wait_call 'pauseBackups 10'
 stop_guard
+# The previous source-v3 format must still restore its clock-source pin.
+{
+ /usr/bin/head -n 1 "$ROOT/state/guard-paused"
+ /usr/bin/sed -n '2p' "$ROOT/state/guard-paused" | /usr/bin/awk '{print "source-v3", $2, $3, $4, $5, $6}'
+ /usr/bin/tail -n +3 "$ROOT/state/guard-paused"
+} > "$ROOT/v3-state"
+mv "$ROOT/v3-state" "$ROOT/state/guard-paused"
+rm -f "$ROOT/state/guard-clock"
 : > "$ROOT/calls"
 start_guard
 sleep 2
@@ -108,10 +118,10 @@ start_guard
 wait_call 'pauseBackups 10'
 console_event 02:05:00 Streaming >> "$LOGS/console.log"
 for attempt in {1..80}; do
- if /usr/bin/sed -n '2p' "$ROOT/state/guard-paused" | grep -q ' console$'; then break; fi
+ if /usr/bin/sed -n '2p' "$ROOT/state/guard-paused" | /usr/bin/awk 'NR == 1 {matched = ($6 == "console")} END {exit !matched}' ; then break; fi
  sleep 0.1
 done
-/usr/bin/sed -n '2p' "$ROOT/state/guard-paused" | grep -q ' console$' \
+/usr/bin/sed -n '2p' "$ROOT/state/guard-paused" | /usr/bin/awk 'NR == 1 {matched = ($6 == "console")} END {exit !matched}'  \
  || { print -u2 'Rollback source was not persisted before renewal'; exit 1; }
 stop_guard
 : > "$ROOT/calls"
@@ -197,6 +207,8 @@ for prior_debug in header active; do
  console_event 04:06:00 Done >> "$LOGS/console.log"
  wait_call resumeBackups
  : > "$ROOT/calls"
+ stop_guard
+ start_guard
  sleep 3
  [[ ! -s "$ROOT/calls" ]] || { print -u2 'Releasing clock pin replayed a stale start'; exit 1; }
  debug_event 04:07:00 STARTED >> "$LOGS/debug.log"
@@ -220,11 +232,51 @@ wait_call resumeBackups
 console_event 05:07:00 Streaming >> "$LOGS/console.log"
 wait_call 'pauseBackups 10'
 : > "$ROOT/calls"
+stop_guard
+start_guard
+sleep 2
+[[ -f "$ROOT/state/guard-paused" && ! -s "$ROOT/calls" ]] \
+ || { print -u2 'Restart forgot superseded clock evidence'; exit 1; }
 mv "$LOGS/console.log" "$LOGS/console.hidden"
 sleep 3
 [[ -f "$ROOT/state/guard-paused" && ! -s "$ROOT/calls" ]] \
  || { print -u2 'Superseded inactive evidence ended current lease'; exit 1; }
 mv "$LOGS/console.hidden" "$LOGS/console.log"
+console_event 05:08:00 Done >> "$LOGS/console.log"
+wait_call resumeBackups
+stop_guard
+# A failed resume retains ownership. A new session before the next renewal
+# must still save the changed clock baseline before a guard restart.
+: > "$ROOT/calls"
+debug_event 05:59:00 TERMINATED > "$LOGS/debug.log"
+console_event 05:58:00 Done > "$LOGS/console.log"
+start_guard
+sleep 2
+console_event 05:05:00 Streaming >> "$LOGS/console.log"
+wait_call 'pauseBackups 10'
+: > "$ROOT/calls"
+: > "$ROOT/fail-resume"
+console_event 05:06:00 Done >> "$LOGS/console.log"
+for attempt in {1..80}; do
+ grep -Fq resumeBackups "$ROOT/calls" && break
+ sleep 0.1
+done
+grep -Fq resumeBackups "$ROOT/calls" && [[ -f "$ROOT/state/guard-paused" ]] \
+ || { print -u2 'Expected failed resume with ownership retained'; exit 1; }
+console_event 05:07:00 Streaming >> "$LOGS/console.log"
+for attempt in {1..80}; do
+ grep -Fq 'inactive|20260909055900000' "$ROOT/state/guard-clock" && break
+ sleep 0.1
+done
+grep -Fq 'inactive|20260909055900000' "$ROOT/state/guard-clock" \
+ || { print -u2 'New session did not persist clock baseline after failed resume'; exit 1; }
+stop_guard
+rm "$ROOT/fail-resume"
+: > "$ROOT/calls"
+start_guard
+sleep 2
+[[ -f "$ROOT/state/guard-paused" && ! -s "$ROOT/calls" ]] \
+ || { print -u2 'Restart after failed resume lost the new session'; exit 1; }
 console_event 05:08:00 Done >> "$LOGS/console.log"
 wait_call resumeBackups
 stop_guard
