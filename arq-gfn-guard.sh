@@ -464,6 +464,8 @@ stopped_explicit_signature=""
 stopped_explicit_evidence=""
 clock_source_key=""
 clock_source_dirty=0
+clock_debug_baseline=""
+clock_console_baseline=""
 
 # Compare small byte checkpoints before trusting append-only growth. Reading
 # at the OLD size detects copytruncate/regrowth without scanning the prefix.
@@ -667,6 +669,8 @@ candidate_evidence() {
   local previous_suffix="$7"
   local source_identity previous_identity source_size previous_size
   local evidence candidate_state candidate_time same_source=0
+  local previous_clock_baseline="$clock_console_baseline"
+  [[ "$source_file" == "$GFN_DEBUG_LOG" ]] && previous_clock_baseline="$clock_debug_baseline"
 
   candidate_state_out=""
   candidate_time_out=""
@@ -733,9 +737,10 @@ candidate_evidence() {
     fi
   fi
   # A backwards timestamp in a verified append establishes a new local-clock
-  # epoch. Keep using that observed source until the process exits; comparing
+  # epoch. Use that source until its session ends or the process exits; comparing
   # it with the other file's old wall clock would resurrect stale evidence.
-  if (( same_source )) && [[ "$candidate_time" =~ ^[0-9]{17}$ \
+  if (( same_source )) && [[ "$previous_state|$previous_time" != "$previous_clock_baseline" \
+      && "$candidate_time" =~ ^[0-9]{17}$ \
       && "$previous_time" =~ ^[0-9]{17}$ && "x$candidate_time" < "x$previous_time" ]]; then
     local observed_clock_key=console
     [[ "$source_file" == "$GFN_DEBUG_LOG" ]] && observed_clock_key=debug
@@ -803,6 +808,10 @@ select_log_source() {
   # Unrelated appends or a launcher-only reopen do not create a new session.
   debug_state="$debug_candidate_state"
   console_state="$console_candidate_state"
+  # An end after clock rollback supersedes the other source's old epoch.
+  # Keep its fingerprint excluded through noise appends until a new event.
+  [[ "$debug_state|$debug_candidate_time" == "$clock_debug_baseline" ]] && debug_state=""
+  [[ "$console_state|$console_candidate_time" == "$clock_console_baseline" ]] && console_state=""
   if [[ "$debug_state" == active && "$debug_state|$debug_candidate_time" == "$stopped_debug_evidence" ]]; then
     debug_state=""
   fi
@@ -861,8 +870,8 @@ select_log_source() {
   selected_source_has_evidence=0
   [[ -n "$selected_state" ]] && selected_source_has_evidence=1
   if [[ -z "$selected_state" ]] \
-      && { [[ "$GFN_LOG_SOURCE_KEY" == debug && "$debug_candidate_state" == active ]] \
-        || [[ "$GFN_LOG_SOURCE_KEY" == console && "$console_candidate_state" == active ]]; }; then
+      && { [[ "$GFN_LOG_SOURCE_KEY" == debug && -n "$debug_candidate_state" ]] \
+        || [[ "$GFN_LOG_SOURCE_KEY" == console && -n "$console_candidate_state" ]]; }; then
     selected_source_suppressed=1
   fi
   selected_source_untrusted=0
@@ -1069,6 +1078,20 @@ reconcile_backup_state() {
     parsed_suffix=""
     source_proof_ready=0
     [[ -f "$STATE_FILE" ]] || clear_alert_episode
+  fi
+
+  if [[ "$detected_stream_state" == inactive && -n "$clock_source_key" ]]; then
+    # End this clock episode without reviving the alternate source's older
+    # start/end. New evidence there can participate in the next session.
+    if [[ "$clock_source_key" == debug ]]; then
+      clock_console_baseline="$console_candidate_state|$console_candidate_time"
+      clock_debug_baseline=""
+    else
+      clock_debug_baseline="$debug_candidate_state|$debug_candidate_time"
+      clock_console_baseline=""
+    fi
+    clock_source_key=""
+    clock_source_dirty=0
   fi
 
   if [[ "$current_stream_state" == "active" ]]; then

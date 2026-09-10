@@ -181,4 +181,51 @@ sleep 3
 print IPC_STREAMING_STARTED_EVENT >> "$EXPLICIT_LOG"
 wait_call 'pauseBackups 10'
 stop_guard
-print 'All source edge tests passed' 
+# A clock rollback must not pin a stale end across later sessions. Cover an
+# alternate source with no prior event and one with an old pre-rollback start.
+for prior_debug in header active; do
+ rm -f "$ROOT/state/guard-paused" "$LOGS/debug.log.bak" "$LOGS/console.log.bak"
+ : > "$ROOT/calls"
+ if [[ "$prior_debug" == header ]]; then print header > "$LOGS/debug.log"
+ else debug_event 04:59:00 STARTED > "$LOGS/debug.log"; fi
+ console_event 04:58:00 Done > "$LOGS/console.log"
+ start_guard
+ sleep 2
+ console_event 04:05:00 Streaming >> "$LOGS/console.log"
+ wait_call 'pauseBackups 10'
+ sleep 2
+ console_event 04:06:00 Done >> "$LOGS/console.log"
+ wait_call resumeBackups
+ : > "$ROOT/calls"
+ sleep 3
+ [[ ! -s "$ROOT/calls" ]] || { print -u2 'Releasing clock pin replayed a stale start'; exit 1; }
+ debug_event 04:07:00 STARTED >> "$LOGS/debug.log"
+ wait_call 'pauseBackups 10'
+ # A fresh end in the other source must supersede the new clock pin too.
+ : > "$ROOT/calls"
+ console_event 04:08:00 Done >> "$LOGS/console.log"
+ wait_call resumeBackups
+ stop_guard
+done
+# A superseded inactive marker must stay excluded if the new source vanishes.
+debug_event 05:59:00 TERMINATED > "$LOGS/debug.log"
+console_event 05:58:00 Done > "$LOGS/console.log"
+start_guard
+sleep 2
+console_event 05:05:00 Streaming >> "$LOGS/console.log"
+wait_call 'pauseBackups 10'
+console_event 05:06:00 Done >> "$LOGS/console.log"
+wait_call resumeBackups
+: > "$ROOT/calls"
+console_event 05:07:00 Streaming >> "$LOGS/console.log"
+wait_call 'pauseBackups 10'
+: > "$ROOT/calls"
+mv "$LOGS/console.log" "$LOGS/console.hidden"
+sleep 3
+[[ -f "$ROOT/state/guard-paused" && ! -s "$ROOT/calls" ]] \
+ || { print -u2 'Superseded inactive evidence ended current lease'; exit 1; }
+mv "$LOGS/console.hidden" "$LOGS/console.log"
+console_event 05:08:00 Done >> "$LOGS/console.log"
+wait_call resumeBackups
+stop_guard
+print 'All source edge tests passed'
