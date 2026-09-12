@@ -483,6 +483,9 @@ console_candidate_state=""
 console_candidate_time=""
 console_candidate_prefix=""
 console_candidate_suffix=""
+# A renamed file can still receive the logger's final event after its
+# marker-free replacement was observed. Follow only an authenticated inode.
+typeset -A candidate_backup_identity candidate_backup_signature
 GFN_LOG_SOURCE_KEY=""
 selected_source_has_evidence=0
 selected_source_available=0
@@ -568,10 +571,11 @@ write_stopped_evidence() {
 
 clear_stopped_evidence() {
   [[ "$GFN_LOG_SOURCE_KEY" != explicit || -z "$stopped_explicit_evidence" ]] || return 0
-  # An unchanged inactive alternate does not establish a new process session.
-  [[ "$GFN_LOG_SOURCE_KEY" != debug \
+  # Retain every unchanged predecessor across restart, even after the other
+  # source starts a new session with a lower wall-clock timestamp.
+  [[ -z "$debug_candidate_state" \
      || "$debug_candidate_state|$debug_candidate_time" != "$stopped_debug_evidence" ]] || return 0
-  [[ "$GFN_LOG_SOURCE_KEY" != console \
+  [[ -z "$console_candidate_state" \
      || "$console_candidate_state|$console_candidate_time" != "$stopped_console_evidence" ]] || return 0
   rm -f "$STOPPED_STATE_FILE" 2>/dev/null || true
 }
@@ -701,6 +705,7 @@ trusted_rotated_evidence() {
   local proof_identity="${2-$parsed_identity}" proof_size="${3-$parsed_size}"
   local proof_prefix="${4-$parsed_prefix}" proof_suffix="${5-$parsed_suffix}"
   trusted_evidence_out=""
+  trusted_backup_identity_out=""
   [[ -n "$proof_identity" ]] || return 0
   log_signature "$backup_file"
   [[ "$log_signature_out" != missing && "$log_signature_out" != unreadable ]] || return 0
@@ -715,6 +720,7 @@ trusted_rotated_evidence() {
            && [[ "$checkpoint_prefix_out" == "$proof_prefix" \
               && "$checkpoint_suffix_out" == "$proof_suffix" ]]; }; then
     trusted_evidence_out="$(parse_stream_evidence "$backup_file" 2>/dev/null)" || return 1
+    trusted_backup_identity_out="$backup_identity"
   fi
   return 0
 }
@@ -910,6 +916,7 @@ candidate_evidence() {
   local previous_suffix="$7"
   local source_identity previous_identity source_size previous_size
   local evidence candidate_state candidate_time same_source=0
+  local backup_signature="" backup_changed=0 primary_evidence=0
   local previous_clock_baseline="$clock_console_baseline"
   [[ "$source_file" == "$GFN_DEBUG_LOG" ]] && previous_clock_baseline="$clock_debug_baseline"
 
@@ -918,13 +925,19 @@ candidate_evidence() {
   candidate_time_out=""
   candidate_prefix_out=""
   candidate_suffix_out=""
-  [[ "$source_signature" != missing && "$source_signature" != unreadable ]] || return 0
+  [[ "$source_signature" != unreadable ]] || return 1
+  [[ "$source_signature" != missing ]] || return 0
   source_identity="${source_signature%:*}"
   source_identity="${source_identity%:*}"
   source_size="${source_signature##*:}"
   previous_identity="${previous_signature%:*}"
   previous_identity="${previous_identity%:*}"
   previous_size="${previous_signature##*:}"
+  if [[ -n "${candidate_backup_identity[$source_file]-}" ]]; then
+    log_signature "$source_file.bak"
+    backup_signature="$log_signature_out"
+    [[ "$backup_signature" == "${candidate_backup_signature[$source_file]-}" ]] || backup_changed=1
+  fi
   if [[ "$source_identity" == "$previous_identity" ]] \
       && (( source_size >= previous_size )) \
       && log_checkpoint "$previous_size" "$source_file" \
@@ -940,16 +953,17 @@ candidate_evidence() {
     # Same signatures are normally enough, but a same-size rewrite can be
     # hidden by coarse mtime resolution. The bounded checkpoint comparison
     # above makes the non-selected source safe too.
-    if [[ "$source_signature" == "$previous_signature" ]]; then
+    if [[ "$source_signature" == "$previous_signature" ]] && (( !backup_changed )); then
       return 0
     fi
   fi
   evidence="$(bounded_stream_evidence "$source_file" "$source_size")" || return 1
   candidate_state="${evidence%%$'\t'*}"
   candidate_time="${evidence#*$'\t'}"
+  [[ -n "$candidate_state" ]] && primary_evidence=1
   if [[ -z "$candidate_state" && -n "$previous_state" ]] \
       && (( source_size - previous_size < LOG_SCAN_BYTES )); then
-    if (( same_source )); then
+    if (( same_source && !backup_changed )); then
       candidate_state="$previous_state"
       candidate_time="$previous_time"
     fi
@@ -967,6 +981,19 @@ candidate_evidence() {
     }
     candidate_state="${evidence%%$'\t'*}"
     candidate_time="${evidence#*$'\t'}"
+    [[ -n "$candidate_state" ]] && primary_evidence=1
+  fi
+  if [[ -z "$candidate_state" && -n "${candidate_backup_identity[$source_file]-}" ]]; then
+    trusted_rotated_evidence "$source_file" "${candidate_backup_identity[$source_file]}" 0 "" "" || return 1
+    if [[ -n "$trusted_evidence_out" ]]; then
+      candidate_state="${trusted_evidence_out%%$'\t'*}"
+      candidate_time="${trusted_evidence_out#*$'\t'}"
+    fi
+    candidate_backup_signature[$source_file]="$backup_signature"
+  elif (( primary_evidence )); then
+    # A lifecycle record in the primary file supersedes the rotated writer.
+    candidate_backup_identity[$source_file]=""
+    candidate_backup_signature[$source_file]=""
   fi
   # Selection must consider a proven rotated event before choosing an older
   # marker in the alternate source. Unknown backups remain ineligible.
@@ -976,6 +1003,8 @@ candidate_evidence() {
     if [[ -n "$trusted_evidence_out" ]]; then
       candidate_state="${trusted_evidence_out%%$'\t'*}"
       candidate_time="${trusted_evidence_out#*$'\t'}"
+      candidate_backup_identity[$source_file]="$trusted_backup_identity_out"
+      candidate_backup_signature[$source_file]="$log_signature_out"
     fi
   fi
   if [[ -z "$candidate_state" ]] \
@@ -985,6 +1014,8 @@ candidate_evidence() {
     if [[ -n "$trusted_evidence_out" ]]; then
       candidate_state="${trusted_evidence_out%%$'\t'*}"
       candidate_time="${trusted_evidence_out#*$'\t'}"
+      candidate_backup_identity[$source_file]="$trusted_backup_identity_out"
+      candidate_backup_signature[$source_file]="$log_signature_out"
     fi
   fi
   # A backwards timestamp in a verified append establishes a new local-clock
@@ -1106,7 +1137,7 @@ select_log_source() {
     clock_source_key="$observed_clock_key"
   fi
 
-  # Old active events belong to the process observed before it stopped.
+  # Old events belong to the process observed before it stopped.
   # Unrelated appends or a launcher-only reopen do not create a new session.
   debug_state="$debug_candidate_state"
   console_state="$console_candidate_state"
@@ -1116,10 +1147,10 @@ select_log_source() {
   # Keep its fingerprint excluded through noise appends until a new event.
   [[ "$debug_state|$debug_candidate_time" == "$clock_debug_baseline" ]] && debug_state=""
   [[ "$console_state|$console_candidate_time" == "$clock_console_baseline" ]] && console_state=""
-  if [[ "$debug_state" == active && "$debug_state|$debug_candidate_time" == "$stopped_debug_evidence" ]]; then
+  if [[ -n "$debug_state" && "$debug_state|$debug_candidate_time" == "$stopped_debug_evidence" ]]; then
     debug_state=""
   fi
-  if [[ "$console_state" == active && "$console_state|$console_candidate_time" == "$stopped_console_evidence" ]]; then
+  if [[ -n "$console_state" && "$console_state|$console_candidate_time" == "$stopped_console_evidence" ]]; then
     console_state=""
   fi
 
@@ -1179,6 +1210,7 @@ select_log_source() {
     selected_source_suppressed=1
   fi
   selected_source_untrusted=0
+  (( debug_evidence_valid && console_evidence_valid )) || selected_source_evidence_invalid=1
   if [[ "$GFN_LOG_SOURCE_KEY" == debug ]]; then
     selected_source_evidence_valid="$debug_evidence_valid"
   else
@@ -1392,7 +1424,7 @@ reconcile_backup_state() {
       # private state file keeps the lease alive until evidence returns.
       current_stream_state="active"
     fi
-    if (( selected_source_untrusted )) || (( !selected_source_available )); then
+    if (( selected_source_untrusted || selected_source_evidence_invalid )) || (( !selected_source_available )); then
       raise_alert "gfn-log-unavailable" "$now_epoch" \
         "GeForce NOW is running, but its session logs are unavailable; backups may not be paused." \
         "GeForce NOW działa, ale jego logi sesji są niedostępne; backup może nie być wstrzymany."
@@ -1437,7 +1469,7 @@ reconcile_backup_state() {
         || [[ -f "$STATE_FILE" && "$detected_stream_state" != "inactive" ]]; then
       current_stream_state="active"
     fi
-    if (( selected_source_untrusted )) || (( !selected_source_available )) \
+    if (( selected_source_untrusted || selected_source_evidence_invalid )) || (( !selected_source_available )) \
         || (( !selected_source_has_evidence )); then
       raise_alert "gfn-log-process-unknown" "$now_epoch" \
         "Could not determine whether GeForce NOW is running; session protection is unavailable." \
@@ -1587,6 +1619,7 @@ restore_alert_episode
 
 last_signature=""
 last_evidence_invalid=0
+last_candidate_evidence=""
 iterations_since_reconcile=$SAFETY_ITERATIONS
 
 while true; do
@@ -1595,10 +1628,12 @@ while true; do
   # during selection must remain a change for the next iteration, not label
   # old evidence with a newer signature and hide it behind the parsed cache.
   current_signature="$selected_signature_out"
+  current_candidate_evidence="$GFN_LOG_SOURCE_KEY|$debug_candidate_state|$debug_candidate_time|$console_candidate_state|$console_candidate_time"
   should_reconcile=0
 
   if [[ "$current_signature" != "$last_signature" \
-      || "$selected_source_evidence_invalid" != "$last_evidence_invalid" ]]; then
+      || "$selected_source_evidence_invalid" != "$last_evidence_invalid" \
+      || "$current_candidate_evidence" != "$last_candidate_evidence" ]]; then
     should_reconcile=1
   else
     iterations_since_reconcile=$(( iterations_since_reconcile + 1 ))
@@ -1616,6 +1651,7 @@ while true; do
     reconcile_backup_state "$now_epoch" "$current_signature"
     last_signature="$current_signature"
     last_evidence_invalid="$selected_source_evidence_invalid"
+    last_candidate_evidence="$current_candidate_evidence"
     iterations_since_reconcile=0
     rotate_log_if_needed
   fi
