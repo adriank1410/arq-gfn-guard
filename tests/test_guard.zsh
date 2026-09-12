@@ -2,6 +2,9 @@
 
 set -eu
 unsetopt bg_nice
+# Failure fixtures must not send desktop alerts. The separate source suite
+# verifies default-on error notifications through a fake external boundary.
+export ARQ_GFN_ERROR_NOTIFICATIONS=0
 
 readonly TEST_DIR="${0:A:h}"
 readonly SCRIPT_DIR="${TEST_DIR:h}"
@@ -45,7 +48,7 @@ start_monitor() {
 }
 
 assert_file_exists() {
-  [[ -f "$1" ]] || { print -u2 -- "Expected file to exist: $1"; exit 1; }
+  [[ -f "$1" ]] || { print -u2 -- "Expected file to exist: $1 (${funcfiletrace[1]})"; exit 1; }
 }
 
 assert_file_missing() {
@@ -89,6 +92,10 @@ fi
   print -u2 -- "Notifications must be disabled by default in the LaunchAgent"
   exit 1
 }
+[[ "$(/usr/bin/plutil -extract EnvironmentVariables.ARQ_GFN_ERROR_NOTIFICATIONS raw -o - "$GUARD_PLIST")" == "1" ]] || {
+  print -u2 -- "Error notifications must be enabled by default"
+  exit 1
+}
 [[ "$(/usr/bin/plutil -extract EnvironmentVariables.ARQ_GFN_LOOP_SECONDS raw -o - "$GUARD_PLIST")" == "2" ]] || {
   print -u2 -- "LaunchAgent must expose the two-second loop default"
   exit 1
@@ -120,7 +127,7 @@ done
   print -u2 -- "English README must document silent-by-default behavior"
   exit 1
 }
-/usr/bin/grep -Fq -- 'Domyślnie działa **bez powiadomień**' "$SCRIPT_DIR/README.pl.md" || {
+/usr/bin/grep -Fq -- 'Domyślnie działa **bez powiadomień o początku i końcu sesji**' "$SCRIPT_DIR/README.pl.md" || {
   print -u2 -- "Polish README must document silent-by-default behavior"
   exit 1
 }
@@ -320,7 +327,8 @@ if [[ -s "$TEST_ROOT/guard.log" ]]; then
 fi
 
 : > "$TEST_ROOT/guard.log"
-print -r -- "IPC_STREAMING_STARTED_EVENT" > "$TEST_ROOT/gfn.log"
+# A new session must add a new lifecycle record after the observed stop.
+print -r -- "IPC_STREAMING_STARTED_EVENT" >> "$TEST_ROOT/gfn.log"
 run_guard 1 4000
 run_guard 1 4030
 pause_count="$(/usr/bin/grep -Fc 'DRY-RUN arqc pauseBackups 10' "$TEST_ROOT/guard.log")"
@@ -341,7 +349,7 @@ pause_count="$(/usr/bin/grep -Fc 'DRY-RUN arqc pauseBackups 10' "$TEST_ROOT/guar
 print -r -- 'not-a-timestamp' > "$TEST_ROOT/state/guard-paused"
 : > "$TEST_ROOT/guard.log"
 run_guard 1 5000
-[[ "$(<"$TEST_ROOT/state/guard-paused")" == "5000" ]] || {
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "5000" ]] || {
   print -u2 -- "Corrupt state timestamp was not repaired"
   exit 1
 }
@@ -352,7 +360,7 @@ assert_log_contains "invalid state timestamp"
 print -r -- '9999999999999999999999999999999999999999' > "$TEST_ROOT/state/guard-paused"
 : > "$TEST_ROOT/guard.log"
 run_guard 1 5100
-[[ "$(<"$TEST_ROOT/state/guard-paused")" == "5100" ]] || {
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "5100" ]] || {
   print -u2 -- "Out-of-range state timestamp was not repaired"
   exit 1
 }
@@ -363,7 +371,7 @@ assert_log_contains "invalid state timestamp"
 print -r -- '9000' > "$TEST_ROOT/state/guard-paused"
 : > "$TEST_ROOT/guard.log"
 run_guard 1 5000
-[[ "$(<"$TEST_ROOT/state/guard-paused")" == "5000" ]] || {
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "5000" ]] || {
   print -u2 -- "Future state timestamp was not repaired"
   exit 1
 }
@@ -425,7 +433,7 @@ ARQ_GFN_GUARD_LOG="$TEST_ROOT/fresh-clock.log" \
 ARQ_GFN_GUARD_ONCE=1 \
 FAKE_DATE_CALL_LOG="$TEST_ROOT/date.calls" \
 "$fresh_clock_guard"
-[[ "$(<"$TEST_ROOT/fresh-clock-state/guard-paused")" == "7000" ]] || {
+[[ "$(head -n 1 "$TEST_ROOT/fresh-clock-state/guard-paused")" == "7000" ]] || {
   print -u2 -- "Guard did not use a fresh wall-clock timestamp"
   exit 1
 }
@@ -542,7 +550,7 @@ run_guard 1 10000
 /usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
 print >> "$TEST_ROOT/gfn.log"
 run_guard 1 10240
-[[ "$(<"$TEST_ROOT/state/guard-paused")" == "10240" ]] || {
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "10240" ]] || {
   print -u2 -- "Growing log lost the owned pause lease"
   exit 1
 }
@@ -602,5 +610,347 @@ ARQ_GFN_GUARD_ONCE=1 "$GUARD_SCRIPT" 2> "$recovery_root/stderr"
 wait_for_calls 'pauseBackups 10'
 assert_file_missing "$recovery_root/state/guard-paused"
 grep -Fq 'failed with exit code 42' "$recovery_root/stderr"
+
+# GFN 2.0.88 no longer forwards streaming events to the reliability monitor.
+# These sanitized lifecycle lines were observed in console.log on both 2.0.87
+# and 2.0.88. Unrelated messages must not be mistaken for a stream transition.
+console_event() {
+  print -r -- "2026-09-09 23:00:08.062 INFO  gfn/StreamerManagerService  Advancing to state: $1 "
+}
+: > "$TEST_ROOT/guard.log"
+console_event Loading > "$TEST_ROOT/gfn.log"
+run_guard 1 20000
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+assert_log_contains "DRY-RUN arqc pauseBackups 10"
+console_event Streaming >> "$TEST_ROOT/gfn.log"
+run_guard 1 20240
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "20240" ]]
+for end_state in PostSessionConnection PostStreaming Done; do
+  console_event "$end_state" >> "$TEST_ROOT/gfn.log"
+  run_guard 1 20250
+  assert_file_missing "$TEST_ROOT/state/guard-paused"
+  console_event Loading >> "$TEST_ROOT/gfn.log"
+  run_guard 1 20260
+  assert_file_exists "$TEST_ROOT/state/guard-paused"
+done
+console_event Done >> "$TEST_ROOT/gfn.log"
+run_guard 1 20270
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+print '2026-09-09 23:00:09.000 INFO  OtherService  Advancing to state: Streaming' >> "$TEST_ROOT/gfn.log"
+console_event StreamingFailure >> "$TEST_ROOT/gfn.log"
+run_guard 1 20280
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
+# Default path regression: stale reliability log + active modern console.
+# HOME is isolated so this test cannot read the real session or invoke Arq.
+modern_home="$TEST_ROOT/modern-home"
+modern_dir="$modern_home/Library/Application Support/NVIDIA/GeForceNOW"
+mkdir -p "$modern_dir/logs"
+print IPC_STREAMING_MODE_EXIT_EVENT > "$modern_dir/logs/gfn_reliability_monitor.log"
+console_event Streaming > "$modern_dir/console.log"
+HOME="$modern_home" ARQ_GFN_GUARD_DRY_RUN=1 ARQ_GFN_FORCE_PROCESS=1 \
+ARQ_GFN_GUARD_ONCE=1 "$GUARD_SCRIPT"
+assert_file_exists "$modern_home/Library/Application Support/ArqGFNGuard/guard-paused"
+console_event Done >> "$modern_dir/console.log"
+HOME="$modern_home" ARQ_GFN_GUARD_DRY_RUN=1 ARQ_GFN_FORCE_PROCESS=1 \
+ARQ_GFN_GUARD_ONCE=1 "$GUARD_SCRIPT"
+assert_file_missing "$modern_home/Library/Application Support/ArqGFNGuard/guard-paused"
+# Generic legacy phrases from other console modules are not session events.
+print '2026-09-09 23:00:09.000 INFO  OtherService streaming started' >> "$modern_dir/console.log"
+HOME="$modern_home" ARQ_GFN_GUARD_DRY_RUN=1 ARQ_GFN_FORCE_PROCESS=1 \
+ARQ_GFN_GUARD_ONCE=1 "$GUARD_SCRIPT"
+assert_file_missing "$modern_home/Library/Application Support/ArqGFNGuard/guard-paused"
+console_event Streaming >> "$modern_dir/console.log"
+print '2026-09-09 23:00:10.000 INFO  OtherService streaming terminated' >> "$modern_dir/console.log"
+HOME="$modern_home" ARQ_GFN_GUARD_DRY_RUN=1 ARQ_GFN_FORCE_PROCESS=1 \
+ARQ_GFN_GUARD_ONCE=1 "$GUARD_SCRIPT"
+assert_file_exists "$modern_home/Library/Application Support/ArqGFNGuard/guard-paused"
+
+# Same long-running process reacts to console events, including rotation with
+# unchanged size/mtime. Exercise both native and fallback stat implementations.
+for rotation_guard in "$GUARD_SCRIPT" "$fallback_guard"; do
+  : > "$TEST_ROOT/guard.log"
+  printf '%-180s\n' "$(console_event Done)" > "$TEST_ROOT/gfn.log"
+  start_monitor 100 "$rotation_guard"
+  /bin/sleep 1.2
+  for console_state in Loading Done; do
+    printf '%-180s\n' "$(console_event "$console_state")" > "$TEST_ROOT/replacement.log"
+    /usr/bin/touch -r "$TEST_ROOT/gfn.log" "$TEST_ROOT/replacement.log"
+    mv -f "$TEST_ROOT/replacement.log" "$TEST_ROOT/gfn.log"
+    if [[ "$console_state" == Loading ]]; then
+      wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+    else
+      wait_for_log "GFN stream inactive; Arq resumed"
+    fi
+  done
+  kill "$monitor_pid"
+  wait "$monitor_pid" 2>/dev/null || true
+  monitor_pid=""
+done
+
+# Long console sessions retain ownership beyond the bounded scan, including
+# a missing log during rotation, and still honor the eventual end event.
+console_event Streaming > "$TEST_ROOT/gfn.log"
+run_guard 1 30000
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+run_guard 1 30240
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "30240" ]]
+rm "$TEST_ROOT/gfn.log"
+run_guard 1 30480
+[[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == "30480" ]]
+console_event Done > "$TEST_ROOT/gfn.log"
+run_guard 1 30490
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
+# If the end event is pushed out of the tail before reconciliation (for
+# example while the Mac sleeps), old ownership must not renew forever.
+console_event Streaming > "$TEST_ROOT/gfn.log"
+run_guard 1 40000
+console_event Done >> "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+run_guard 1 40240
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
+# First install/restart mid-stream must also recover an older start event,
+# even when no existing ownership file can supply the state.
+console_event Streaming > "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+run_guard 1 41000
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+run_guard 0 41010
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
+# The following independent parser fixture deliberately reuses its timestamp.
+rm -f "$TEST_ROOT/state/guard-stopped"
+
+# Relocating a console must not turn unrelated text into legacy events.
+console_event Streaming > "$TEST_ROOT/gfn.log"
+print '2026-09-09 23:00:10.000 INFO  OtherService streaming terminated' >> "$TEST_ROOT/gfn.log"
+run_guard 1 42000
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+console_event Done >> "$TEST_ROOT/gfn.log"
+print '2026-09-09 23:00:11.000 INFO  OtherService streaming started' >> "$TEST_ROOT/gfn.log"
+run_guard 1 42010
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
+# Instrument the external awk invocation, but execute the real parser. An old
+# event outside the tail needs one recovery scan, not one scan per append.
+awk_probe="$TEST_ROOT/awk-probe"
+cat > "$awk_probe" <<'AWK_PROBE'
+#!/bin/zsh
+if [[ "${@[-1]}" == "$ARQ_AWK_SOURCE" ]]; then
+  print full >> "$ARQ_AWK_LOG"
+fi
+exec /usr/bin/awk "$@"
+AWK_PROBE
+chmod +x "$awk_probe"
+cache_guard="$TEST_ROOT/cache-guard.zsh"
+sed "s#/usr/bin/awk#$awk_probe#g" "$GUARD_SCRIPT" > "$cache_guard"
+chmod +x "$cache_guard"
+console_event Streaming > "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+: > "$TEST_ROOT/guard.log"
+: > "$TEST_ROOT/awk.calls"
+export ARQ_AWK_SOURCE="$TEST_ROOT/gfn.log" ARQ_AWK_LOG="$TEST_ROOT/awk.calls"
+start_monitor 1 "$cache_guard"
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+for append_number in 1 2 3; do
+  print "unrelated append $append_number" >> "$TEST_ROOT/gfn.log"
+  /bin/sleep 1.5
+  kill -0 "$monitor_pid"
+done
+[[ "$(wc -l < "$TEST_ROOT/awk.calls" | tr -d ' ')" == 1 ]] || {
+  print -u2 -- "Repeated full scans after ordinary log appends"
+  exit 1
+}
+# A large unseen burst may contain an end outside the tail: recover it.
+# Stop only this disposable test process while constructing that burst.
+kill -STOP "$monitor_pid"
+console_event Done >> "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+kill -CONT "$monitor_pid"
+wait_for_log "GFN stream inactive; Arq resumed"
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+[[ "$(wc -l < "$TEST_ROOT/awk.calls" | tr -d ' ')" == 2 ]]
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+unset ARQ_AWK_SOURCE ARQ_AWK_LOG
+
+# copytruncate can regrow past its previous size before the next poll. Size
+# growth alone does not prove append-only writes; the cached end must clear.
+console_event Done > "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1000000 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+: > "$TEST_ROOT/guard.log"
+start_monitor 1
+/bin/sleep 1.5
+kill -STOP "$monitor_pid"
+console_event Streaming > "$TEST_ROOT/gfn.log"
+/usr/bin/head -c 1048577 /dev/zero | /usr/bin/tr '\0' 'x' >> "$TEST_ROOT/gfn.log"
+print >> "$TEST_ROOT/gfn.log"
+kill -CONT "$monitor_pid"
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+
+# Missing zsh/system must use recovery scans instead of trusting an
+# unchecked cache. The actual awk parser and file I/O still execute.
+system_fallback_guard="$TEST_ROOT/system-fallback.zsh"
+rm -f "$TEST_ROOT/state/guard-paused"
+sed 's@zmodload zsh/system@zmodload zsh/arq_gfn_missing_system@' \
+  "$GUARD_SCRIPT" > "$system_fallback_guard"
+chmod +x "$system_fallback_guard"
+: > "$TEST_ROOT/guard.log"
+console_event Done > "$TEST_ROOT/gfn.log"
+start_monitor 1 "$system_fallback_guard"
+/bin/sleep 1.2
+console_event Streaming >> "$TEST_ROOT/gfn.log"
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+console_event Done >> "$TEST_ROOT/gfn.log"
+wait_for_log "GFN stream inactive; Arq resumed"
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+
+# Recover an end written just before rename rotation or copytruncate.
+for rotation_mode in rename copy; do
+  : > "$TEST_ROOT/guard.log"
+  console_event Streaming > "$TEST_ROOT/gfn.log"
+  start_monitor 1
+  wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+  kill -STOP "$monitor_pid"
+  console_event Done >> "$TEST_ROOT/gfn.log"
+  if [[ "$rotation_mode" == rename ]]; then
+    mv -f "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+  else
+    cp "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+  fi
+  print 'new console; no session transition yet' > "$TEST_ROOT/gfn.log"
+  kill -CONT "$monitor_pid"
+  wait_for_log "GFN stream inactive; Arq resumed"
+  assert_file_missing "$TEST_ROOT/state/guard-paused"
+  kill "$monitor_pid"
+  wait "$monitor_pid" 2>/dev/null || true
+  monitor_pid=""
+done
+
+# A stale unrelated .bak must never supply an end for the current session.
+: > "$TEST_ROOT/guard.log"
+console_event Streaming > "$TEST_ROOT/gfn.log"
+console_event Done > "$TEST_ROOT/gfn.log.bak"
+start_monitor 1
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+kill -STOP "$monitor_pid"
+mv "$TEST_ROOT/gfn.log" "$TEST_ROOT/unrelated-rotation.log"
+print 'new console; no session transition yet' > "$TEST_ROOT/gfn.log"
+kill -CONT "$monitor_pid"
+/bin/sleep 2
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+console_event Done >> "$TEST_ROOT/gfn.log"
+wait_for_log "GFN stream inactive; Arq resumed"
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+
+# Safety reconciliation must validate content even when size, inode and
+# whole-second mtime remain identical across an in-place rewrite.
+: > "$TEST_ROOT/guard.log"
+printf '%-180s\n' "$(console_event Done)" > "$TEST_ROOT/gfn.log"
+cp -p "$TEST_ROOT/gfn.log" "$TEST_ROOT/unchanged-stamp"
+start_monitor 1
+/bin/sleep 1.2
+printf '%-180s\n' "$(console_event Streaming)" > "$TEST_ROOT/gfn.log"
+touch -r "$TEST_ROOT/unchanged-stamp" "$TEST_ROOT/gfn.log"
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+printf '%-180s\n' "$(console_event Done)" > "$TEST_ROOT/gfn.log"
+touch -r "$TEST_ROOT/unchanged-stamp" "$TEST_ROOT/gfn.log"
+wait_for_log "GFN stream inactive; Arq resumed"
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+
+# Persist source evidence with the owned lease, then recover an end rotated
+# while the guard was stopped. No cached in-process identity is available.
+console_event Streaming > "$TEST_ROOT/gfn.log"
+run_guard 1 50000
+assert_file_exists "$TEST_ROOT/state/guard-paused"
+console_event Done >> "$TEST_ROOT/gfn.log"
+mv -f "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+print 'new console with no transition' > "$TEST_ROOT/gfn.log"
+run_guard 1 50010
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+
+# Malformed/truncated optional source evidence must not affect the legacy
+# timestamp reader or prevent reconciliation against the real current log.
+for proof_header in 'source-v1 invalid 20' 'source-v1 1:2 invalid' 'source-v1 1:2 999999999999999999999999' 'source-v1 1:2 128'; do
+  printf '1\n%s\nshort\n' "$proof_header" > "$TEST_ROOT/state/guard-paused"
+  console_event Streaming > "$TEST_ROOT/gfn.log"
+  run_guard 1 51000
+  [[ "$(head -n 1 "$TEST_ROOT/state/guard-paused")" == 51000 ]]
+  console_event Done >> "$TEST_ROOT/gfn.log"
+  run_guard 1 51010
+  assert_file_missing "$TEST_ROOT/state/guard-paused"
+done
+
+# A closed GFN process ends the old observation epoch. Reopening just the
+# launcher must not resurrect an active marker from the previous process bak.
+process_probe="$TEST_ROOT/process-probe"
+cat > "$process_probe" <<'PROCESS_PROBE'
+#!/bin/zsh
+[[ "$(<"$GFN_PROBE_FILE")" == running ]]
+PROCESS_PROBE
+chmod +x "$process_probe"
+process_guard="$TEST_ROOT/process-guard.zsh"
+sed "s#/usr/bin/pgrep#$process_probe#g" "$GUARD_SCRIPT" > "$process_guard"
+chmod +x "$process_guard"
+print running > "$TEST_ROOT/process-state"
+console_event Streaming > "$TEST_ROOT/gfn.log"
+: > "$TEST_ROOT/guard.log"
+GFN_PROBE_FILE="$TEST_ROOT/process-state" ARQ_GFN_GUARD_DRY_RUN=1 \
+ARQ_GFN_LOG_FILE="$TEST_ROOT/gfn.log" ARQ_GFN_STATE_DIR="$TEST_ROOT/state" \
+ARQ_GFN_GUARD_LOG="$TEST_ROOT/guard.log" ARQ_GFN_LOOP_SECONDS=1 \
+ARQ_GFN_SAFETY_SECONDS=1 "$process_guard" &
+monitor_pid=$!
+wait_for_log "GFN stream active; Arq pause renewed for 10 minutes"
+print stopped > "$TEST_ROOT/process-state"
+wait_for_log "GFN stream inactive; Arq resumed"
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+kill -STOP "$monitor_pid"
+mv -f "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+print 'new launcher only' > "$TEST_ROOT/gfn.log"
+print running > "$TEST_ROOT/process-state"
+kill -CONT "$monitor_pid"
+/bin/sleep 2
+assert_file_missing "$TEST_ROOT/state/guard-paused"
+kill "$monitor_pid"
+wait "$monitor_pid" 2>/dev/null || true
+monitor_pid=""
+
+# Renewing from a trusted rotated start must persist the new source identity,
+# so another rotation plus restart can still recover its end transition.
+rm -f "$TEST_ROOT/state/guard-stopped"
+for new_source_mode in header empty; do
+  console_event Streaming > "$TEST_ROOT/gfn.log"
+  run_guard 1 60000
+  mv -f "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+  : > "$TEST_ROOT/gfn.log"
+  [[ "$new_source_mode" == empty ]] || print 'new console header' > "$TEST_ROOT/gfn.log"
+  run_guard 1 60250
+  assert_file_exists "$TEST_ROOT/state/guard-paused"
+  console_event Done >> "$TEST_ROOT/gfn.log"
+  mv -f "$TEST_ROOT/gfn.log" "$TEST_ROOT/gfn.log.bak"
+  print 'third console generation' > "$TEST_ROOT/gfn.log"
+  run_guard 1 60500
+  assert_file_missing "$TEST_ROOT/state/guard-paused"
+done
 
 print -r -- "All Arq GFN guard tests passed"
