@@ -29,7 +29,7 @@ large_diagnostics() { /usr/bin/awk 'BEGIN {for(i=0;i<16000;i++) print "diagnosti
 start_guard() {
  env HOME="$ROOT/home" ARQ_GFN_ARQC="$ROOT/arqc" ARQ_GFN_STATE_DIR="$ROOT/state" \
  ARQ_GFN_GUARD_LOG="$ROOT/guard.log" ARQ_GFN_FORCE_PROCESS=1 \
- ARQ_GFN_LOOP_SECONDS=1 ARQ_GFN_SAFETY_SECONDS=1 ARQ_GFN_NOTIFICATIONS=0 \
+ ARQ_GFN_LOOP_SECONDS=1 ARQ_GFN_SAFETY_SECONDS="${TEST_SAFETY_SECONDS:-1}" ARQ_GFN_NOTIFICATIONS=0 \
  ARQ_GFN_ERROR_NOTIFICATIONS=0 "$ROOT/guard" &
  monitor_pid=$!
 }
@@ -61,8 +61,10 @@ stop_guard
 rm -f "$ROOT/state/guard-paused"
 : > "$TEST_CALLS"
 : > "$TEST_FAIL_SCAN"
+rm "$LOGS/debug.log"
 # A failed full scan is not a valid empty-history result. Retry it even when
 # the source signature remains unchanged and the next tail still has no event.
+TEST_SAFETY_SECONDS=60
 start_guard
 wait_owned
 stop_guard

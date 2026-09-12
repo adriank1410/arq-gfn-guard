@@ -318,7 +318,9 @@ raise_alert() {
     slot_started="$action_alert_started"
     slot_notified="$action_alert_notified"
   fi
-  if [[ "$slot_kind" != "$kind" ]] || (( slot_started > now_epoch )); then
+  if { [[ "$slot_kind" != "$kind" ]] \
+      && [[ "$slot_name" != detection || -z "$slot_kind" ]]; } \
+      || (( slot_started > now_epoch )); then
     slot_kind="$kind"
     slot_started="$now_epoch"
     slot_notified=0
@@ -404,6 +406,7 @@ parse_stream_evidence() {
       latest_state = next_state
       latest_time = event_time
       latest_line = NR
+      latest_record = $0
     }
     / INFO +gfn\/StreamerManagerService +Advancing to state: (Loading|Streaming)[[:space:]]*$/ {
       record_state("active", line_timestamp())
@@ -430,10 +433,15 @@ parse_stream_evidence() {
     END {
       # Timestamp-free diagnostic fixtures need the event position to tell a
       # repeated new start from unrelated lines appended after an old start.
-      if (watermark && latest_time == "") print latest_state "\t" latest_time "\t" latest_line
+      if (watermark) print latest_state "\t" latest_time "\t" latest_line "\t" latest_record
       else print latest_state "\t" latest_time
     }
   ' "$@"
+}
+
+explicit_event_watermark() {
+  setopt localoptions pipefail
+  parse_stream_evidence --watermark "$GFN_LOG_FILE" 2>/dev/null | /usr/bin/cksum
 }
 
 # Include one preceding byte so a window beginning exactly on a full record
@@ -503,7 +511,7 @@ clock_failure_notified=0
 
 restore_stopped_evidence() {
   [[ -e "$STOPPED_STATE_FILE" || -L "$STOPPED_STATE_FILE" ]] || return 0
-  local saved_debug saved_console extra evidence_fd
+  local saved_debug saved_console extra evidence_fd saved_explicit="" saved_override=""
   local invalid=0
   local evidence_pattern='^(active|inactive)?[|]([0-9]{17})?$'
   if [[ ! -f "$STOPPED_STATE_FILE" ]]; then
@@ -513,7 +521,12 @@ restore_stopped_evidence() {
   else
     if ! IFS= read -r -u "$evidence_fd" saved_debug; then invalid=1; fi
     if (( !invalid )) && ! IFS= read -r -u "$evidence_fd" saved_console; then invalid=1; fi
-    if (( !invalid )) && IFS= read -r -u "$evidence_fd" extra; then invalid=1; fi
+    if (( !invalid )) && IFS= read -r -u "$evidence_fd" saved_explicit; then
+      IFS= read -r -u "$evidence_fd" saved_override || invalid=1
+      local explicit_pattern='^[0-9]+ [0-9]+$'
+      [[ "$saved_explicit" =~ "$explicit_pattern" ]] || invalid=1
+      if IFS= read -r -u "$evidence_fd" extra; then invalid=1; fi
+    fi
     if (( !invalid )) && [[ ! "$saved_debug" =~ "$evidence_pattern" ]]; then invalid=1; fi
     if (( !invalid )) && [[ ! "$saved_console" =~ "$evidence_pattern" ]]; then invalid=1; fi
     exec {evidence_fd}<&-
@@ -524,6 +537,9 @@ restore_stopped_evidence() {
   fi
   stopped_debug_evidence="$saved_debug"
   stopped_console_evidence="$saved_console"
+  if [[ -n "$GFN_LOG_OVERRIDE" && "$saved_override" == "$GFN_LOG_OVERRIDE" ]]; then
+    stopped_explicit_evidence="$saved_explicit"
+  fi
 }
 
 write_stopped_evidence() {
@@ -535,6 +551,10 @@ write_stopped_evidence() {
   if ! {
     print -r -- "$stopped_debug_evidence"
     print -r -- "$stopped_console_evidence"
+    if [[ -n "$GFN_LOG_OVERRIDE" && "$GFN_LOG_OVERRIDE" != *$'\n'* ]]; then
+      print -r -- "$stopped_explicit_evidence"
+      print -r -- "$GFN_LOG_OVERRIDE"
+    fi
   } > "$temporary_stopped"; then
     rm -f "$temporary_stopped"
     return 1
@@ -547,6 +567,12 @@ write_stopped_evidence() {
 }
 
 clear_stopped_evidence() {
+  [[ "$GFN_LOG_SOURCE_KEY" != explicit || -z "$stopped_explicit_evidence" ]] || return 0
+  # An unchanged inactive alternate does not establish a new process session.
+  [[ "$GFN_LOG_SOURCE_KEY" != debug \
+     || "$debug_candidate_state|$debug_candidate_time" != "$stopped_debug_evidence" ]] || return 0
+  [[ "$GFN_LOG_SOURCE_KEY" != console \
+     || "$console_candidate_state|$console_candidate_time" != "$stopped_console_evidence" ]] || return 0
   rm -f "$STOPPED_STATE_FILE" 2>/dev/null || true
 }
 
@@ -674,8 +700,6 @@ trusted_rotated_evidence() {
   local backup_file="$1.bak" backup_identity backup_size
   local proof_identity="${2-$parsed_identity}" proof_size="${3-$parsed_size}"
   local proof_prefix="${4-$parsed_prefix}" proof_suffix="${5-$parsed_suffix}"
-  local proof_event_time="${6-$parsed_event_time}"
-  local backup_evidence backup_state backup_event_time
   trusted_evidence_out=""
   [[ -n "$proof_identity" ]] || return 0
   log_signature "$backup_file"
@@ -691,21 +715,6 @@ trusted_rotated_evidence() {
            && [[ "$checkpoint_prefix_out" == "$proof_prefix" \
               && "$checkpoint_suffix_out" == "$proof_suffix" ]]; }; then
     trusted_evidence_out="$(parse_stream_evidence "$backup_file" 2>/dev/null)" || return 1
-  elif (( proof_size > 0 && backup_size > proof_size )) \
-      && [[ "$proof_event_time" =~ ^[0-9]{17}$ ]] \
-      && log_checkpoint "$proof_size" "$backup_file" \
-      && [[ "$checkpoint_prefix_out" == "$proof_prefix" ]]; then
-    # A copy-rotate changes the suffix when a new lifecycle line is appended
-    # just before rotation. The stable prefix plus a strictly newer event
-    # watermark authenticates that append without trusting an arbitrary .bak.
-    backup_evidence="$(parse_stream_evidence "$backup_file" 2>/dev/null)" || return 1
-    backup_state="${backup_evidence%%$'\t'*}"
-    backup_event_time="${backup_evidence#*$'\t'}"
-    if [[ "$backup_state" == active || "$backup_state" == inactive ]] \
-        && [[ "$backup_event_time" =~ ^[0-9]{17}$ ]] \
-        && [[ "x$backup_event_time" > "x$proof_event_time" ]]; then
-      trusted_evidence_out="$backup_evidence"
-    fi
   fi
   return 0
 }
@@ -721,6 +730,12 @@ latest_stream_state() {
     return 0
   fi
   if (( selected_source_suppressed )); then
+    if [[ "$GFN_LOG_SOURCE_KEY" == debug \
+          && "$debug_candidate_state|$debug_candidate_time" == "$stopped_debug_evidence" ]] \
+        || [[ "$GFN_LOG_SOURCE_KEY" == console \
+          && "$console_candidate_state|$console_candidate_time" == "$stopped_console_evidence" ]]; then
+      detected_stream_state_out=inactive
+    fi
     return 0
   fi
   [[ -f "$GFN_LOG_FILE" && "$source_signature" != missing \
@@ -798,9 +813,12 @@ latest_stream_state() {
   if [[ -n "$GFN_LOG_OVERRIDE" && "$detected_state" == active \
       && -n "$stopped_explicit_evidence" ]]; then
     local explicit_watermark
-    explicit_watermark="$(parse_stream_evidence --watermark "$GFN_LOG_FILE" 2>/dev/null)" || return 0
+    explicit_watermark="$(explicit_event_watermark)" || return 0
     # Unrelated appends change stat without establishing a new session.
-    [[ "$explicit_watermark" == "$stopped_explicit_evidence" ]] && return 0
+    if [[ "$explicit_watermark" == "$stopped_explicit_evidence" ]]; then
+      detected_stream_state_out=inactive
+      return 0
+    fi
     stopped_explicit_evidence=""
   fi
 
@@ -809,7 +827,10 @@ latest_stream_state() {
   # neither an older end nor an older start proves a new state. Preserve the
   # last parsed proof and let the normal missing/unknown alert expose the gap.
   selected_source_untrusted=0
-  if [[ "$previous_source_key" != "$source_key" && "$clock_source_key" != "$source_key" ]] \
+  if [[ "$clock_source_key" != "$source_key" ]] \
+      && { [[ "$previous_source_key" != "$source_key" ]] \
+        || { (( replacement )) && [[ "$detected_event_time" =~ ^[0-9]{17}$ \
+             && "$parsed_event_time" =~ ^[0-9]{17}$ ]]; }; } \
       && [[ "$previous_source_key" != legacy || "$source_identity" != "$parsed_identity" ]] \
       && [[ -n "$parsed_stream_state" && -n "$detected_state" ]]; then
     if [[ -z "$detected_event_time" || -z "$parsed_event_time" || "$parsed_event_time" == - ]] \
@@ -969,9 +990,13 @@ candidate_evidence() {
   # A backwards timestamp in a verified append establishes a new local-clock
   # epoch. Use that source until its session ends or the process exits; comparing
   # it with the other file's old wall clock would resurrect stale evidence.
-  if (( same_source )) && [[ "$previous_state|$previous_time" != "$previous_clock_baseline" \
-      && "$candidate_time" =~ ^[0-9]{17}$ \
-      && "$previous_time" =~ ^[0-9]{17}$ && "x$candidate_time" < "x$previous_time" ]]; then
+  if (( same_source )) && [[ "$candidate_time" =~ ^[0-9]{17}$ \
+      && "$previous_time" =~ ^[0-9]{17}$ && "x$candidate_time" < "x$previous_time" ]] \
+      && { [[ "$previous_state|$previous_time" != "$previous_clock_baseline" ]] \
+        || [[ "$parsed_event_time" =~ ^[0-9]{17}$ && "x$candidate_time" < "x$parsed_event_time" ]]; }; then
+    # An excluded predecessor is from the old epoch. A new event later than
+    # the accepted end belongs to the current epoch; an earlier event proves
+    # another rollback and needs a new pin.
     local observed_clock_key=console
     [[ "$source_file" == "$GFN_DEBUG_LOG" ]] && observed_clock_key=debug
     candidate_clock_rollback_out=1
@@ -1391,7 +1416,7 @@ reconcile_backup_state() {
       parsed_stream_state="active"
       [[ "$parsed_event_time" =~ ^[0-9]{17}$ ]] || parsed_event_time="-"
       source_proof_ready=1
-      if write_state_timestamp "$now_epoch"; then
+      if read_state_timestamp && write_state_timestamp "$state_epoch_out"; then
         source_checkpoint_dirty=0
       else
         raise_alert "state-save-failure" "$now_epoch" \
@@ -1430,7 +1455,7 @@ reconcile_backup_state() {
     stopped_console_evidence="$console_candidate_state|$console_candidate_time"
     if [[ -n "$GFN_LOG_OVERRIDE" && "$source_signature" != "$stopped_explicit_signature" \
         && "$source_signature" != missing && "$source_signature" != unreadable ]]; then
-      stopped_explicit_evidence="$(parse_stream_evidence --watermark "$GFN_LOG_FILE" 2>/dev/null)" \
+      stopped_explicit_evidence="$(explicit_event_watermark)" \
         || stopped_explicit_evidence=""
     fi
     stopped_explicit_signature="$source_signature"
@@ -1519,8 +1544,7 @@ reconcile_backup_state() {
         "The GeForce NOW session ended, but Arq backups could not be resumed." \
         "Sesja GeForce NOW się zakończyła, ale nie udało się wznowić backupu Arq." 1
     fi
-  elif [[ "$process_state" == "running" \
-      && "$detected_stream_state" == "inactive" ]]; then
+  elif [[ "$detected_stream_state" == "inactive" ]]; then
     clear_action_alert
   fi
 }
@@ -1562,6 +1586,7 @@ restore_stopped_evidence || true
 restore_alert_episode
 
 last_signature=""
+last_evidence_invalid=0
 iterations_since_reconcile=$SAFETY_ITERATIONS
 
 while true; do
@@ -1572,7 +1597,8 @@ while true; do
   current_signature="$selected_signature_out"
   should_reconcile=0
 
-  if [[ "$current_signature" != "$last_signature" ]]; then
+  if [[ "$current_signature" != "$last_signature" \
+      || "$selected_source_evidence_invalid" != "$last_evidence_invalid" ]]; then
     should_reconcile=1
   else
     iterations_since_reconcile=$(( iterations_since_reconcile + 1 ))
@@ -1589,6 +1615,7 @@ while true; do
     now_epoch="$epoch_value_out"
     reconcile_backup_state "$now_epoch" "$current_signature"
     last_signature="$current_signature"
+    last_evidence_invalid="$selected_source_evidence_invalid"
     iterations_since_reconcile=0
     rotate_log_if_needed
   fi

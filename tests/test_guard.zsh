@@ -48,7 +48,7 @@ start_monitor() {
 }
 
 assert_file_exists() {
-  [[ -f "$1" ]] || { print -u2 -- "Expected file to exist: $1"; exit 1; }
+  [[ -f "$1" ]] || { print -u2 -- "Expected file to exist: $1 (${funcfiletrace[1]})"; exit 1; }
 }
 
 assert_file_missing() {
@@ -327,7 +327,8 @@ if [[ -s "$TEST_ROOT/guard.log" ]]; then
 fi
 
 : > "$TEST_ROOT/guard.log"
-print -r -- "IPC_STREAMING_STARTED_EVENT" > "$TEST_ROOT/gfn.log"
+# A new session must add a new lifecycle record after the observed stop.
+print -r -- "IPC_STREAMING_STARTED_EVENT" >> "$TEST_ROOT/gfn.log"
 run_guard 1 4000
 run_guard 1 4030
 pause_count="$(/usr/bin/grep -Fc 'DRY-RUN arqc pauseBackups 10' "$TEST_ROOT/guard.log")"
@@ -722,6 +723,9 @@ assert_file_exists "$TEST_ROOT/state/guard-paused"
 run_guard 0 41010
 assert_file_missing "$TEST_ROOT/state/guard-paused"
 
+# The following independent parser fixture deliberately reuses its timestamp.
+rm -f "$TEST_ROOT/state/guard-stopped"
+
 # Relocating a console must not turn unrelated text into legacy events.
 console_event Streaming > "$TEST_ROOT/gfn.log"
 print '2026-09-09 23:00:10.000 INFO  OtherService streaming terminated' >> "$TEST_ROOT/gfn.log"
@@ -933,6 +937,7 @@ monitor_pid=""
 
 # Renewing from a trusted rotated start must persist the new source identity,
 # so another rotation plus restart can still recover its end transition.
+rm -f "$TEST_ROOT/state/guard-stopped"
 for new_source_mode in header empty; do
   console_event Streaming > "$TEST_ROOT/gfn.log"
   run_guard 1 60000

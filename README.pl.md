@@ -144,6 +144,8 @@ zsh tests/test_tail_boundaries.zsh
 zsh tests/test_clock_persistence.zsh
 zsh tests/test_clock_write_failure.zsh
 zsh tests/test_empty_history.zsh
+zsh tests/test_source_regressions.zsh
+zsh tests/test_review_lifecycle.zsh
 plutil -lint com.local.arq-gfn-guard.plist
 ```
 
