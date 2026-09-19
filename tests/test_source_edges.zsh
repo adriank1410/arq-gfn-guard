@@ -277,7 +277,10 @@ rm "$ROOT/fail-resume"
 : > "$ROOT/calls"
 start_guard
 sleep 2
-[[ -f "$ROOT/state/guard-paused" && ! -s "$ROOT/calls" ]] \
+# Resume intent invalidates the renewal timestamp before calling Arq. If the
+# restart interrupts the next pause, renewing it here is safe and required;
+# accepting the stale end from the other clock epoch is never safe.
+[[ -f "$ROOT/state/guard-paused" ]] && ! grep -Fq resumeBackups "$ROOT/calls" \
  || { print -u2 'Restart after failed resume lost the new session'; exit 1; }
 console_event 05:08:00 Done >> "$LOGS/console.log"
 wait_call resumeBackups

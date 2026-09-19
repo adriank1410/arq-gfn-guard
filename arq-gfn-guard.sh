@@ -871,11 +871,20 @@ latest_stream_state() {
   fi
 
   if [[ -n "$GFN_LOG_OVERRIDE" ]]; then
+    # A replacement's stale marker must not detach the authenticated writer.
+    # It can still receive the current session's end after the rename.
+    if [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" \
+        && "$detected_event_time" =~ ^[0-9]{17}$ \
+        && "$parsed_event_time" =~ ^[0-9]{17}$ \
+        && "$detected_event_time" < "$parsed_event_time" ]]; then
+      detected_state=""
+      detected_event_time=""
+      explicit_backup_changed=1
+    fi
     if [[ -n "$detected_state" ]]; then
       explicit_evidence_file_out="$GFN_LOG_FILE"
-      candidate_backup_identity[$GFN_LOG_FILE]=""
-      candidate_backup_signature[$GFN_LOG_FILE]=""
     elif (( explicit_backup_changed )) && [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" ]]; then
+      explicit_evidence_file_out="$GFN_LOG_FILE.bak"
       trusted_rotated_evidence "$GFN_LOG_FILE" "${candidate_backup_identity[$GFN_LOG_FILE]}" 0 "" "" || return 0
       if [[ -n "$trusted_evidence_out" ]]; then
         detected_state="${trusted_evidence_out%%$'\t'*}"
@@ -923,6 +932,11 @@ latest_stream_state() {
   if (( stale_alternate )); then
     detected_stream_state_out=""
     return 0
+  fi
+  if [[ -n "$GFN_LOG_OVERRIDE" && -n "$detected_state" \
+      && "$explicit_evidence_file_out" == "$GFN_LOG_FILE" ]]; then
+    candidate_backup_identity[$GFN_LOG_FILE]=""
+    candidate_backup_signature[$GFN_LOG_FILE]=""
   fi
   if [[ -z "$detected_state" ]] && (( ! recover )); then
     detected_state="$parsed_stream_state"
@@ -1060,6 +1074,16 @@ candidate_evidence() {
     candidate_state="${evidence%%$'\t'*}"
     candidate_time="${evidence#*$'\t'}"
     [[ -n "$candidate_state" ]] && primary_evidence=1
+  fi
+  # Keep the authenticated writer when a replacement exposes an older marker;
+  # accepting that marker would discard the current session's eventual end.
+  if [[ -n "${candidate_backup_identity[$source_file]-}" \
+      && "$candidate_time" =~ ^[0-9]{17}$ \
+      && "$previous_time" =~ ^[0-9]{17}$ \
+      && "$candidate_time" < "$previous_time" ]]; then
+    candidate_state=""
+    candidate_time=""
+    primary_evidence=0
   fi
   if [[ -z "$candidate_state" && -n "${candidate_backup_identity[$source_file]-}" ]]; then
     trusted_rotated_evidence "$source_file" "${candidate_backup_identity[$source_file]}" 0 "" "" \
