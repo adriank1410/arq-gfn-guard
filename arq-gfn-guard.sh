@@ -704,6 +704,7 @@ trusted_rotated_evidence() {
   local backup_file="$1.bak" backup_identity backup_size
   local proof_identity="${2-$parsed_identity}" proof_size="${3-$parsed_size}"
   local proof_prefix="${4-$parsed_prefix}" proof_suffix="${5-$parsed_suffix}"
+  local proof_state="${6-$parsed_stream_state}" proof_time="${7-$parsed_event_time}"
   trusted_evidence_out=""
   trusted_backup_identity_out=""
   [[ -n "$proof_identity" ]] || return 0
@@ -721,6 +722,11 @@ trusted_rotated_evidence() {
               && "$checkpoint_suffix_out" == "$proof_suffix" ]]; }; then
     trusted_evidence_out="$(parse_stream_evidence "$backup_file" 2>/dev/null)" || return 1
     trusted_backup_identity_out="$backup_identity"
+    # A later rotation can evict the original lifecycle line from both files.
+    # Authenticated continuity retains its state; an actual new event wins.
+    if [[ -z "${trusted_evidence_out%%$'\t'*}" && -n "$proof_state" ]]; then
+      trusted_evidence_out="$proof_state"$'\t'"$proof_time"
+    fi
   fi
   return 0
 }
@@ -777,6 +783,7 @@ latest_stream_state() {
   source_identity="${source_identity%:*}"
   local source_size="${source_signature##*:}"
   local recover=0 replacement=0 detected_state detected_event_time evidence stale_alternate=0
+  local same_parsed_source=0
   local previous_source_key="$parsed_source_key"
   if [[ -n "$parsed_identity" ]]; then
     if [[ "$source_identity" != "$parsed_identity" ]] || (( source_size <= parsed_size )); then
@@ -786,6 +793,12 @@ latest_stream_state() {
            || "$checkpoint_suffix_out" != "$parsed_suffix" ]]; then
       replacement=1
     fi
+  fi
+  if [[ "$source_identity" == "$parsed_identity" && "$source_key" == "$parsed_source_key" ]] \
+      && (( source_size >= parsed_size )) && log_checkpoint "$parsed_size" \
+      && [[ "$checkpoint_prefix_out" == "$parsed_prefix" \
+         && "$checkpoint_suffix_out" == "$parsed_suffix" ]]; then
+    same_parsed_source=1
   fi
   (( replacement )) && source_checkpoint_dirty=1
   if [[ -z "$parsed_signature" ]] \
@@ -814,6 +827,11 @@ latest_stream_state() {
     evidence="$(parse_stream_evidence "$GFN_LOG_FILE" 2>/dev/null)" || return 0
     detected_state="${evidence%%$'\t'*}"
     detected_event_time="${evidence#*$'\t'}"
+  fi
+
+  if [[ -n "$GFN_LOG_OVERRIDE" && -z "$detected_state" ]] && (( same_parsed_source )); then
+    detected_state="$parsed_stream_state"
+    detected_event_time="$parsed_event_time"
   fi
 
   if [[ -n "$GFN_LOG_OVERRIDE" && "$detected_state" == active \
@@ -984,7 +1002,8 @@ candidate_evidence() {
     [[ -n "$candidate_state" ]] && primary_evidence=1
   fi
   if [[ -z "$candidate_state" && -n "${candidate_backup_identity[$source_file]-}" ]]; then
-    trusted_rotated_evidence "$source_file" "${candidate_backup_identity[$source_file]}" 0 "" "" || return 1
+    trusted_rotated_evidence "$source_file" "${candidate_backup_identity[$source_file]}" 0 "" "" \
+      "$previous_state" "$previous_time" || return 1
     if [[ -n "$trusted_evidence_out" ]]; then
       candidate_state="${trusted_evidence_out%%$'\t'*}"
       candidate_time="${trusted_evidence_out#*$'\t'}"
@@ -999,7 +1018,7 @@ candidate_evidence() {
   # marker in the alternate source. Unknown backups remain ineligible.
   if [[ -z "$candidate_state" && "$previous_identity" == *:* ]]; then
     trusted_rotated_evidence "$source_file" "$previous_identity" "$previous_size" \
-      "$previous_prefix" "$previous_suffix" || return 1
+      "$previous_prefix" "$previous_suffix" "$previous_state" "$previous_time" || return 1
     if [[ -n "$trusted_evidence_out" ]]; then
       candidate_state="${trusted_evidence_out%%$'\t'*}"
       candidate_time="${trusted_evidence_out#*$'\t'}"
@@ -1324,6 +1343,21 @@ restore_source_checkpoint() {
     parsed_prefix="$prefix_data"
     parsed_suffix="$suffix_data"
     source_proof_ready=1
+    # Seed only this source's candidate. Its inode and byte checkpoints are
+    # revalidated by candidate_evidence before retaining the saved lifecycle.
+    if [[ "$proof_source_key" == debug ]]; then
+      debug_candidate_signature="$proof_identity:0:$proof_size"
+      debug_candidate_state=active
+      debug_candidate_time="${proof_event_time/-/}"
+      debug_candidate_prefix="$prefix_data"
+      debug_candidate_suffix="$suffix_data"
+    elif [[ "$proof_source_key" == console ]]; then
+      console_candidate_signature="$proof_identity:0:$proof_size"
+      console_candidate_state=active
+      console_candidate_time="${proof_event_time/-/}"
+      console_candidate_prefix="$prefix_data"
+      console_candidate_suffix="$suffix_data"
+    fi
   } always {
     exec {proof_fd}<&-
   }
@@ -1425,9 +1459,15 @@ reconcile_backup_state() {
       current_stream_state="active"
     fi
     if (( selected_source_untrusted || selected_source_evidence_invalid )) || (( !selected_source_available )); then
-      raise_alert "gfn-log-unavailable" "$now_epoch" \
-        "GeForce NOW is running, but its session logs are unavailable; backups may not be paused." \
-        "GeForce NOW działa, ale jego logi sesji są niedostępne; backup może nie być wstrzymany."
+      if [[ -f "$STATE_FILE" ]]; then
+        raise_alert "gfn-log-unavailable" "$now_epoch" \
+          "GFN session state cannot be reliably read from its logs. The guard is still trying to maintain its Arq pause." \
+          "Nie można wiarygodnie odczytać stanu sesji GFN z logów. Guard nadal próbuje utrzymać pauzę Arq."
+      else
+        raise_alert "gfn-log-unavailable" "$now_epoch" \
+          "GFN session state cannot be reliably read from its logs; backups may not be paused." \
+          "Nie można wiarygodnie odczytać stanu sesji GFN z logów; backup może nie być wstrzymany."
+      fi
     elif (( !selected_source_has_evidence )); then
       raise_alert "gfn-log-state-unknown" "$now_epoch" \
         "GeForce NOW is running, but no recognized session state was found; backups may not be paused." \
@@ -1437,13 +1477,14 @@ reconcile_backup_state() {
       clear_detection_alert
     fi
     if [[ "$current_stream_state" == active && -f "$STATE_FILE" \
-        && -z "$detected_stream_state" \
+        && ( -z "$detected_stream_state" || "$detected_stream_state" == active ) \
         && "$parsed_signature" == "$source_signature" \
         && "$parsed_identity" =~ ^[0-9]{1,18}:[0-9]{1,18}$ ]] \
         && (( source_checkpoint_dirty )) \
         && (( selected_source_available )) \
         && (( ! selected_source_untrusted )); then
-      # Persist a marker-free replacement's identity/checkpoints immediately.
+      # Persist every accepted replacement's identity/checkpoints immediately,
+      # including continuity inherited from an authenticated marker-free backup.
       # This updates recovery proof only; it does not renew Arq's lease.
       parsed_stream_state="active"
       [[ "$parsed_event_time" =~ ^[0-9]{17}$ ]] || parsed_event_time="-"
@@ -1560,6 +1601,19 @@ reconcile_backup_state() {
       fi
     fi
   elif [[ -f "$STATE_FILE" ]]; then
+    if [[ "$detected_stream_state" == inactive && -z "$GFN_LOG_OVERRIDE" ]]; then
+      # The end may exist only in an authenticated .bak. Before removing its
+      # lease proof, persist which candidate events belong to the ended session
+      # so a restart cannot accept the other file's unchanged older start.
+      stopped_debug_evidence="$debug_candidate_state|$debug_candidate_time"
+      stopped_console_evidence="$console_candidate_state|$console_candidate_time"
+      if ! write_stopped_evidence; then
+        raise_alert "state-save-failure" "$now_epoch" \
+          "The GFN session ended, but its recovery state could not be saved; Arq resume will be retried." \
+          "Sesja GFN się zakończyła, ale nie zapisano jej stanu; wznowienie Arq zostanie ponowione." 1
+        return 0
+      fi
+    fi
     # Arq exposes one global pause and no supported CLI readback for the pause
     # that existed before this guard acted. The state file proves that this
     # guard successfully issued a pause, but overlapping independent manual

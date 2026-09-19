@@ -20,9 +20,10 @@ setup() {
 step() { select_log_source; reconcile_backup_state "$1" "$selected_signature_out"; }
 restart() { ARQ_GFN_NOW="$1" ARQ_GFN_GUARD_ONCE=1 "$GUARD"; }
 failures=0
-for scenario in lease stopped rollback alerts action-alert replacement explicit resume unrelated-backup late-backup stopped-inactive candidate-error; do
+for scenario in lease stopped rollback alerts action-alert replacement explicit resume unrelated-backup late-backup stopped-inactive candidate-error repeated-rename repeated-copy repeated-explicit repeated-backup-end repeated-stop end-save-failure missing-owned missing-unowned; do
   (
     setup "$scenario"
+    [[ "$scenario" != repeated-explicit ]] || export ARQ_GFN_LOG_FILE="$HOME/Library/Application Support/NVIDIA/GeForceNOW/console.log"
     if [[ "$scenario" == candidate-error ]]; then
       # Replace only the external tail reader to inject a real scan error.
       export ARQ_TEST_SCAN_FAIL="$ROOT/tail.fail"
@@ -35,6 +36,71 @@ for scenario in lease stopped rollback alerts action-alert replacement explicit 
       source <(awk '/^restore_source_checkpoint \|\| true$/ {exit} {print}' "$GUARD")
     fi
     case "$scenario" in
+      end-save-failure)
+        event 11:00:00.000 Streaming "$GFN_DEBUG_LOG"; step 1000
+        event 11:30:00.000 Done "$GFN_DEBUG_LOG"
+        chmod 500 "$STATE_DIR"
+        step 1010
+        chmod 700 "$STATE_DIR"
+        check test -f "$STATE_FILE"
+        check test "$action_alert_kind" = state-save-failure
+        check test "$(grep -c '^resumeBackups$' "$ARQ_TEST_ACTIONS" || true)" = 0
+        step 1020
+        check test ! -f "$STATE_FILE"
+        check test "$(grep -c '^resumeBackups$' "$ARQ_TEST_ACTIONS")" = 1
+        ;;
+      missing-owned|missing-unowned)
+        if [[ "$scenario" == missing-owned ]]; then
+          event 11:00:00.000 Streaming "$GFN_DEBUG_LOG"; step 1000
+          rm "$GFN_DEBUG_LOG"
+        fi
+        step 1250
+        check test -n "$detection_alert_kind"
+        check grep -q 'cannot be reliably read' "$GUARD_LOG"
+        if [[ "$scenario" == missing-owned ]]; then
+          check grep -q 'trying to maintain its Arq pause' "$GUARD_LOG"
+          check test "$(grep -c '^pauseBackups' "$ARQ_TEST_ACTIONS")" = 2
+          ARQ_GFN_FORCE_PROCESS=0; step 1260
+          check test ! -f "$STATE_FILE"
+        else
+          check grep -q 'backups may not be paused' "$GUARD_LOG"
+          check test ! -f "$STATE_FILE"
+        fi
+        ;;
+      repeated-rename|repeated-copy|repeated-explicit|repeated-backup-end|repeated-stop)
+        event 11:00:00.000 Streaming "$GFN_DEBUG_LOG"
+        event 11:00:00.010 Streaming "$GFN_CONSOLE_LOG"; step 1000
+        for rotation in 1 2 3; do
+          if [[ "$scenario" == repeated-copy ]]; then
+            cp "$GFN_CONSOLE_LOG" "$GFN_CONSOLE_LOG.bak"
+          else
+            mv -f "$GFN_CONSOLE_LOG" "$GFN_CONSOLE_LOG.bak"
+          fi
+          print "Performing log rotation $rotation." > "$GFN_CONSOLE_LOG"
+          step $((1000 + rotation * 10))
+          check test "$GFN_LOG_FILE" = "$GFN_CONSOLE_LOG"
+          check test "$detected_stream_state_out" = active
+          check test -z "$detection_alert_kind"
+          check test "$(head -1 "$STATE_FILE")" = 1000
+          restart $((1001 + rotation * 10))
+          check test ! -f "$ALERT_DETECTION_STATE_FILE"
+          check test -f "$STATE_FILE"
+        done
+        if [[ "$scenario" == repeated-stop ]]; then
+          ARQ_GFN_FORCE_PROCESS=0
+        elif [[ "$scenario" == repeated-backup-end ]]; then
+          event 11:30:00.000 Done "$GFN_CONSOLE_LOG.bak"
+        else
+          event 11:30:00.000 Done "$GFN_CONSOLE_LOG"
+        fi
+        step 1100
+        check test ! -f "$STATE_FILE"
+        # The launcher can stay open or reopen without starting a new game.
+        ARQ_GFN_FORCE_PROCESS=1
+        restart 1110
+        check test ! -f "$STATE_FILE"
+        check test "$(grep -c '^resumeBackups$' "$ARQ_TEST_ACTIONS")" = 1
+        ;;
       late-backup)
         event 11:00:00.000 Streaming "$GFN_DEBUG_LOG"; step 1000
         mv "$GFN_DEBUG_LOG" "$GFN_DEBUG_LOG.bak"
