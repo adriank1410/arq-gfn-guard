@@ -247,6 +247,8 @@ wait_call resumeBackups
 stop_guard
 # A failed resume retains ownership. A new session before the next renewal
 # must still save the changed clock baseline before a guard restart.
+# This independent fixture reuses the previous session's exact timestamps.
+rm -f "$ROOT/state/guard-stopped"
 : > "$ROOT/calls"
 debug_event 05:59:00 TERMINATED > "$LOGS/debug.log"
 console_event 05:58:00 Done > "$LOGS/console.log"
