@@ -21,10 +21,10 @@ setup() {
 step() { select_log_source; reconcile_backup_state "$1" "$selected_signature_out"; }
 restart() { ARQ_GFN_NOW="$1" ARQ_GFN_GUARD_ONCE=1 "${SCENARIO_GUARD:-$GUARD}"; }
 failures=0
-for scenario in lease stopped rollback alerts action-alert replacement explicit resume unrelated-backup late-backup stopped-inactive candidate-error repeated-rename repeated-copy repeated-explicit repeated-explicit-backup-end repeated-backup-end repeated-stop end-save-failure resume-metadata-failure explicit-resume-race explicit-stale-primary default-stale-primary explicit-stale-active default-stale-active resume-remove-failure explicit-missing-writer missing-owned missing-unowned; do
+for scenario in lease stopped rollback alerts action-alert replacement explicit resume unrelated-backup late-backup stopped-inactive candidate-error repeated-rename repeated-copy repeated-explicit repeated-explicit-backup-end repeated-backup-end repeated-stop end-save-failure resume-metadata-failure explicit-resume-race explicit-stale-primary default-stale-primary explicit-stale-active default-stale-active resume-remove-failure explicit-missing-writer writer-retry-pause writer-retry-state explicit-writer-retry-pause explicit-writer-retry-state missing-owned missing-unowned; do
   (
     setup "$scenario"
-    [[ "$scenario" != repeated-explicit* && "$scenario" != explicit-resume-race && "$scenario" != explicit-stale-* && "$scenario" != explicit-missing-writer ]] || export ARQ_GFN_LOG_FILE="$HOME/Library/Application Support/NVIDIA/GeForceNOW/console.log"
+    [[ "$scenario" != repeated-explicit* && "$scenario" != explicit-resume-race && "$scenario" != explicit-stale-* && "$scenario" != explicit-missing-writer && "$scenario" != explicit-writer-retry-* ]] || export ARQ_GFN_LOG_FILE="$HOME/Library/Application Support/NVIDIA/GeForceNOW/console.log"
     if [[ "$scenario" == candidate-error ]]; then
       # Replace only the external tail reader to inject a real scan error.
       export ARQ_TEST_SCAN_FAIL="$ROOT/tail.fail"
@@ -33,10 +33,10 @@ for scenario in lease stopped rollback alerts action-alert replacement explicit 
         'exec /usr/bin/tail "$@"' > "$ROOT/tail"
       chmod +x "$ROOT/tail"
       source <(sed "s#/usr/bin/tail#$ROOT/tail#g" "$GUARD" | awk '/^restore_source_checkpoint \|\| true$/ {exit} {print}')
-    elif [[ "$scenario" == resume-metadata-failure || "$scenario" == end-save-failure ]]; then
+    elif [[ "$scenario" == resume-metadata-failure || "$scenario" == end-save-failure || "$scenario" == *writer-retry-state ]]; then
       export ARQ_TEST_STOP_SAVE_FAIL="$ROOT/stop-save.fail"
       export ARQ_TEST_STATE_FAIL_PATTERN='.guard-stopped.'
-      [[ "$scenario" != end-save-failure ]] || ARQ_TEST_STATE_FAIL_PATTERN='.guard-paused.'
+      [[ "$scenario" != end-save-failure && "$scenario" != *writer-retry-state ]] || ARQ_TEST_STATE_FAIL_PATTERN='.guard-paused.'
       print -rl -- '#!/bin/zsh' '[[ "$1" == *"$ARQ_TEST_STATE_FAIL_PATTERN"* && -f "$ARQ_TEST_STOP_SAVE_FAIL" ]] && exit 42' \
         'exec /usr/bin/mktemp "$@"' > "$ROOT/mktemp"
       chmod +x "$ROOT/mktemp"
@@ -48,6 +48,24 @@ for scenario in lease stopped rollback alerts action-alert replacement explicit 
       source <(awk '/^restore_source_checkpoint \|\| true$/ {exit} {print}' "$GUARD")
     fi
     case "$scenario" in
+      writer-retry-*|explicit-writer-retry-*)
+        event 11:00:00.000 Streaming "$GFN_CONSOLE_LOG"; step 1000
+        mv "$GFN_CONSOLE_LOG" "$GFN_CONSOLE_LOG.bak"
+        print noise > "$GFN_CONSOLE_LOG"; step 1010
+        event 11:01:00.000 Done "$GFN_CONSOLE_LOG.bak"; step 1020
+        event 11:02:00.000 Streaming "$GFN_CONSOLE_LOG.bak"
+        if [[ "$scenario" == *-state ]]; then touch "$ARQ_TEST_STOP_SAVE_FAIL"
+        else touch "$ARQ_TEST_ACTIONS.fail"; fi
+        restart 1030
+        check test ! -f "$STATE_FILE"
+        check test -f "$STOPPED_STATE_FILE"
+        if [[ "$scenario" == *-state ]]; then rm "$ARQ_TEST_STOP_SAVE_FAIL"
+        else rm "$ARQ_TEST_ACTIONS.fail"; fi
+        restart 1040
+        check test -f "$STATE_FILE"
+        event 11:03:00.000 Done "$GFN_CONSOLE_LOG.bak"; restart 1050
+        check test ! -f "$STATE_FILE"
+        ;;
       resume-remove-failure)
         event 11:00:00.000 Streaming "$GFN_CONSOLE_LOG"; step 1000
         event 11:01:00.000 Done "$GFN_CONSOLE_LOG"

@@ -1591,7 +1591,7 @@ reconcile_backup_state() {
     latest_stream_state "$source_signature"
     detected_stream_state="$detected_stream_state_out"
     [[ -n "$detected_stream_state" ]] && selected_source_has_evidence=1
-    if [[ "$detected_stream_state" == active || "$detected_stream_state" == inactive ]] \
+    if [[ "$detected_stream_state" == inactive ]] \
         && (( ! selected_source_untrusted )); then
       clear_stopped_evidence
     fi
@@ -1646,7 +1646,7 @@ reconcile_backup_state() {
     latest_stream_state "$source_signature"
     detected_stream_state="$detected_stream_state_out"
     [[ -n "$detected_stream_state" ]] && selected_source_has_evidence=1
-    if [[ "$detected_stream_state" == active || "$detected_stream_state" == inactive ]] \
+    if [[ "$detected_stream_state" == inactive ]] \
         && (( ! selected_source_untrusted )); then
       clear_stopped_evidence
     fi
@@ -1724,6 +1724,11 @@ reconcile_backup_state() {
     if (( now_epoch - previous_renewal >= RENEW_SECONDS )); then
       if run_arqc pauseBackups "$PAUSE_MINUTES"; then
         if write_state_timestamp "$now_epoch"; then
+          # The ended-session record may be our sole rotated-writer proof.
+          # Retire it only after the new pause and its ownership are durable.
+          if [[ "$detected_stream_state" == active ]] && (( ! selected_source_untrusted )); then
+            clear_stopped_evidence
+          fi
           clock_source_dirty=0
           clear_action_alert
           log_message "GFN stream active; Arq pause renewed for $PAUSE_MINUTES minutes"
