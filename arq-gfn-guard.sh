@@ -441,7 +441,7 @@ parse_stream_evidence() {
 
 explicit_event_watermark() {
   setopt localoptions pipefail
-  parse_stream_evidence --watermark "$GFN_LOG_FILE" 2>/dev/null | /usr/bin/cksum
+  parse_stream_evidence --watermark "${1:-$GFN_LOG_FILE}" 2>/dev/null | /usr/bin/cksum
 }
 
 # Include one preceding byte so a window beginning exactly on a full record
@@ -514,7 +514,8 @@ clock_failure_notified=0
 
 restore_stopped_evidence() {
   [[ -e "$STOPPED_STATE_FILE" || -L "$STOPPED_STATE_FILE" ]] || return 0
-  local saved_debug saved_console extra evidence_fd saved_explicit="" saved_override=""
+  local saved_debug saved_console extra evidence_fd saved_explicit="" saved_override="" saved_writers=""
+  local writer_version debug_writer="-" console_writer="-" explicit_writer="-"
   local invalid=0
   local evidence_pattern='^(active|inactive)?[|]([0-9]{17})?$'
   if [[ ! -f "$STOPPED_STATE_FILE" ]]; then
@@ -525,10 +526,23 @@ restore_stopped_evidence() {
     if ! IFS= read -r -u "$evidence_fd" saved_debug; then invalid=1; fi
     if (( !invalid )) && ! IFS= read -r -u "$evidence_fd" saved_console; then invalid=1; fi
     if (( !invalid )) && IFS= read -r -u "$evidence_fd" saved_explicit; then
-      IFS= read -r -u "$evidence_fd" saved_override || invalid=1
-      local explicit_pattern='^[0-9]+ [0-9]+$'
-      [[ "$saved_explicit" =~ "$explicit_pattern" ]] || invalid=1
+      if [[ "$saved_explicit" == writers-v1\ * ]]; then
+        saved_writers="$saved_explicit"
+        saved_explicit=""
+      else
+        IFS= read -r -u "$evidence_fd" saved_override || invalid=1
+        local explicit_pattern='^[0-9]+ [0-9]+$'
+        [[ "$saved_explicit" =~ "$explicit_pattern" ]] || invalid=1
+        IFS= read -r -u "$evidence_fd" saved_writers || saved_writers=""
+      fi
       if IFS= read -r -u "$evidence_fd" extra; then invalid=1; fi
+    fi
+    if [[ -n "$saved_writers" ]]; then
+      IFS=' ' read -r writer_version debug_writer console_writer explicit_writer extra <<< "$saved_writers"
+      local writer_pattern='^(-|[0-9]{1,18}:[0-9]{1,18})$'
+      [[ "$writer_version" == writers-v1 && -z "$extra" \
+        && "$debug_writer" =~ "$writer_pattern" && "$console_writer" =~ "$writer_pattern" \
+        && "$explicit_writer" =~ "$writer_pattern" ]] || invalid=1
     fi
     if (( !invalid )) && [[ ! "$saved_debug" =~ "$evidence_pattern" ]]; then invalid=1; fi
     if (( !invalid )) && [[ ! "$saved_console" =~ "$evidence_pattern" ]]; then invalid=1; fi
@@ -540,13 +554,23 @@ restore_stopped_evidence() {
   fi
   stopped_debug_evidence="$saved_debug"
   stopped_console_evidence="$saved_console"
+  # An active lease carries its own, newer writer proof. Ended-session metadata
+  # must not attach an older writer to that new session.
+  if [[ ! -f "$STATE_FILE" ]]; then
+    [[ "$debug_writer" == - ]] || candidate_backup_identity[$GFN_DEBUG_LOG]="$debug_writer"
+    [[ "$console_writer" == - ]] || candidate_backup_identity[$GFN_CONSOLE_LOG]="$console_writer"
+  fi
   if [[ -n "$GFN_LOG_OVERRIDE" && "$saved_override" == "$GFN_LOG_OVERRIDE" ]]; then
     stopped_explicit_evidence="$saved_explicit"
+    [[ -f "$STATE_FILE" || "$explicit_writer" == - ]] || candidate_backup_identity[$GFN_LOG_FILE]="$explicit_writer"
   fi
 }
 
 write_stopped_evidence() {
   local temporary_stopped
+  local debug_writer="${candidate_backup_identity[$GFN_DEBUG_LOG]:--}"
+  local console_writer="${candidate_backup_identity[$GFN_CONSOLE_LOG]:--}" explicit_writer="-"
+  [[ -z "$GFN_LOG_OVERRIDE" ]] || explicit_writer="${candidate_backup_identity[$GFN_LOG_OVERRIDE]:--}"
   local evidence_pattern='^(active|inactive)?[|]([0-9]{17})?$'
   [[ "$stopped_debug_evidence" =~ "$evidence_pattern" \
       && "$stopped_console_evidence" =~ "$evidence_pattern" ]] || return 1
@@ -557,6 +581,9 @@ write_stopped_evidence() {
     if [[ -n "$GFN_LOG_OVERRIDE" && "$GFN_LOG_OVERRIDE" != *$'\n'* ]]; then
       print -r -- "$stopped_explicit_evidence"
       print -r -- "$GFN_LOG_OVERRIDE"
+    fi
+    if [[ "$debug_writer|$console_writer|$explicit_writer" != '-|-|-' ]]; then
+      print -r -- "writers-v1 $debug_writer $console_writer $explicit_writer"
     fi
   } > "$temporary_stopped"; then
     rm -f "$temporary_stopped"
@@ -736,6 +763,7 @@ latest_stream_state() {
   local source_signature="$1"
   local source_key="${GFN_LOG_SOURCE_KEY:-explicit}"
   detected_stream_state_out=""
+  explicit_evidence_file_out="$GFN_LOG_FILE"
   local selected_candidate_state="" selected_candidate_time=""
   local explicit_backup_signature="" explicit_backup_changed=0
   if [[ -z "$GFN_LOG_OVERRIDE" ]] && (( ! selected_source_evidence_valid )); then
@@ -771,6 +799,7 @@ latest_stream_state() {
       selected_candidate_time="$console_candidate_time"
     fi
   elif [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" ]]; then
+    explicit_evidence_file_out="$GFN_LOG_FILE.bak"
     log_signature "$GFN_LOG_FILE.bak"
     explicit_backup_signature="$log_signature_out"
     [[ "$explicit_backup_signature" == "${candidate_backup_signature[$GFN_LOG_FILE]-}" ]] || explicit_backup_changed=1
@@ -843,6 +872,7 @@ latest_stream_state() {
 
   if [[ -n "$GFN_LOG_OVERRIDE" ]]; then
     if [[ -n "$detected_state" ]]; then
+      explicit_evidence_file_out="$GFN_LOG_FILE"
       candidate_backup_identity[$GFN_LOG_FILE]=""
       candidate_backup_signature[$GFN_LOG_FILE]=""
     elif (( explicit_backup_changed )) && [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" ]]; then
@@ -862,7 +892,7 @@ latest_stream_state() {
   if [[ -n "$GFN_LOG_OVERRIDE" && ( "$detected_state" == active || -z "$detected_state" ) \
       && -n "$stopped_explicit_evidence" ]]; then
     local explicit_watermark
-    explicit_watermark="$(explicit_event_watermark)" || return 0
+    explicit_watermark="$(explicit_event_watermark "$explicit_evidence_file_out")" || return 0
     # Unrelated appends change stat without establishing a new session.
     if [[ "$explicit_watermark" == "$stopped_explicit_evidence" ]]; then
       detected_stream_state_out=inactive
@@ -907,6 +937,7 @@ latest_stream_state() {
         detected_state="${trusted_evidence_out%%$'\t'*}"
         detected_event_time="${trusted_evidence_out#*$'\t'}"
         if [[ -n "$GFN_LOG_OVERRIDE" ]]; then
+          explicit_evidence_file_out="$GFN_LOG_FILE.bak"
           candidate_backup_identity[$GFN_LOG_FILE]="$trusted_backup_identity_out"
           candidate_backup_signature[$GFN_LOG_FILE]="$log_signature_out"
         fi
@@ -1661,19 +1692,41 @@ reconcile_backup_state() {
     # that existed before this guard acted. The state file proves that this
     # guard successfully issued a pause, but overlapping independent manual
     # pauses are intentionally documented as unsupported.
+    local save_session_end=0 ended_watermark=""
+    if [[ "$detected_stream_state" == inactive ]] \
+        && { [[ -z "$GFN_LOG_OVERRIDE" ]] || [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" ]]; }; then
+      save_session_end=1
+      if [[ -n "$GFN_LOG_OVERRIDE" ]]; then
+        local end_record end_state end_time
+        end_record="$(parse_stream_evidence --watermark "$explicit_evidence_file_out")" || return 0
+        end_state="${end_record%%$'\t'*}"
+        end_time="${end_record#*$'\t'}"
+        end_time="${end_time%%$'\t'*}"
+        # Do not acknowledge a new lifecycle that arrived during our read.
+        if [[ "$parsed_stream_state" == inactive ]] \
+            && [[ "$end_state" != inactive || "${end_time:--}" != "$parsed_event_time" ]]; then
+          return 0
+        fi
+        ended_watermark="$(print -r -- "$end_record" | /usr/bin/cksum)" || return 0
+      fi
+    fi
+    # Once resume succeeds this lease is no longer a confirmed pause. Invalidate
+    # its timestamp first, atomically retaining recovery proof. If later metadata
+    # fails, a new session must issue a fresh pause instead of waiting four minutes.
+    if ! write_state_timestamp 0; then
+      raise_alert "state-save-failure" "$now_epoch" \
+        "Could not save Arq resume intent; resume will be retried." \
+        "Nie zapisano zamiaru wznowienia Arq; operacja zostanie ponowiona." 1
+      return 0
+    fi
     if run_arqc resumeBackups; then
-      if [[ "$detected_stream_state" == inactive ]] \
-          && { [[ -z "$GFN_LOG_OVERRIDE" ]] || [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" ]]; }; then
-        # The end may exist only in an authenticated .bak. After a successful resume and before removing its
-        # lease proof, persist which candidate events belong to the ended session
-        # so a restart cannot accept the other file's unchanged older start.
+      if (( save_session_end )); then
+        # Preserve the ended fingerprints and authenticated writer before removing
+        # the lease proof. The writer may also receive another session after restart.
         stopped_debug_evidence="$debug_candidate_state|$debug_candidate_time"
         stopped_console_evidence="$console_candidate_state|$console_candidate_time"
-        local end_evidence_ready=1
-        if [[ -n "$GFN_LOG_OVERRIDE" ]]; then
-          stopped_explicit_evidence="$(explicit_event_watermark)" || end_evidence_ready=0
-        fi
-        if (( !end_evidence_ready )) || ! write_stopped_evidence; then
+        [[ -z "$GFN_LOG_OVERRIDE" ]] || stopped_explicit_evidence="$ended_watermark"
+        if ! write_stopped_evidence; then
           raise_alert "state-save-failure" "$now_epoch" \
             "Arq resumed, but the ended session could not be saved; recovery will be retried." \
             "Arq wznowił backup, ale nie zapisano zakończenia sesji; zapis zostanie ponowiony." 1
