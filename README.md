@@ -55,6 +55,8 @@ The overlap tolerates temporary scheduling delays. If the guard crashes or is un
 
 Arq's CLI exposes one global pause and does not expose the previous pause state. Do not overlap an independent manual Arq pause with a GeForce NOW session: the guard's lease may replace it, and the automatic resume may end it. This limitation does not affect normal guard-controlled sessions.
 
+Successive authenticated rotations retain the last confirmed session state even after its original event leaves both the log and `.bak`. Replacement checkpoints and the identity of an authenticated rotated writer are saved without extending the Arq lease, and are revalidated after a guard restart. An end recorded only in `.bak` also survives a later restart without replaying the ended session. The authenticated writer remains tracked after resume so it can report a later new session, even while the primary file has no lifecycle records. Unrelated backups remain untrusted. An unavailable/untrusted-log warning describes uncertainty about the logs; when the guard owns a pause, it reports that it is still trying to maintain it, rather than implying that the pause failed.
+
 ## Install
 
 No `sudo` required — this is a per-user LaunchAgent.

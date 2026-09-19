@@ -55,6 +55,8 @@ Zapas chroni przed chwilowymi opóźnieniami procesu. Jeśli guard się zamknie 
 
 CLI Arq udostępnia jedną globalną pauzę i nie pozwala odczytać poprzedniego stanu. Nie łącz niezależnej ręcznej pauzy Arq z sesją GeForce NOW: pauza guarda może ją zastąpić, a automatyczne wznowienie — zakończyć. Ograniczenie nie wpływa na zwykłe sesje kontrolowane przez guard.
 
+Kolejne potwierdzone rotacje zachowują ostatni rozpoznany stan sesji, nawet gdy pierwotny wpis zniknie zarówno z logu, jak i `.bak`. Fragmenty kontrolne nowego pliku oraz tożsamość potwierdzonego pliku po rotacji są zapisywane bez przesuwania czasu odnowienia pauzy Arq i ponownie sprawdzane po restarcie guarda. Koniec zapisany wyłącznie w `.bak` również nie powoduje przywrócenia zakończonej sesji po kolejnym restarcie. Potwierdzony plik po rotacji pozostaje obserwowany po wznowieniu backupu, aby wykryć zapisaną tam kolejną sesję, nawet gdy plik podstawowy nie zawiera zdarzeń sesji. Niepowiązane kopie pozostają niewiarygodne. Ostrzeżenie o niedostępnych lub niewiarygodnych logach opisuje niepewność ich odczytu; gdy guard ma własną pauzę, informuje o dalszych próbach jej utrzymania, zamiast sugerować niepowodzenie pauzowania.
+
 ## Instalacja
 
 Nie używaj `sudo` — to LaunchAgent bieżącego użytkownika.

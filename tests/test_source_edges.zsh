@@ -78,7 +78,9 @@ stop_guard
 
 # Backward local timestamps during an observed append must not lose to a
 # stale end in the other source, including while the owned guard restarts.
-rm -f "$ROOT/state/guard-paused"
+# Start an independent clock fixture, without the preceding 23:00 writer
+# proof: that proof correctly makes these rewritten 01:00 files stale.
+rm -f "$ROOT/state/guard-paused" "$ROOT/state/guard-stopped" "$LOGS/console.log.bak"
 : > "$ROOT/calls"
 debug_event 01:59:00 TERMINATED > "$LOGS/debug.log"
 console_event 01:58:00 Done > "$LOGS/console.log"
@@ -247,6 +249,8 @@ wait_call resumeBackups
 stop_guard
 # A failed resume retains ownership. A new session before the next renewal
 # must still save the changed clock baseline before a guard restart.
+# This independent fixture reuses the previous session's exact timestamps.
+rm -f "$ROOT/state/guard-stopped"
 : > "$ROOT/calls"
 debug_event 05:59:00 TERMINATED > "$LOGS/debug.log"
 console_event 05:58:00 Done > "$LOGS/console.log"
@@ -275,7 +279,10 @@ rm "$ROOT/fail-resume"
 : > "$ROOT/calls"
 start_guard
 sleep 2
-[[ -f "$ROOT/state/guard-paused" && ! -s "$ROOT/calls" ]] \
+# Resume intent invalidates the renewal timestamp before calling Arq. If the
+# restart interrupts the next pause, renewing it here is safe and required;
+# accepting the stale end from the other clock epoch is never safe.
+[[ -f "$ROOT/state/guard-paused" ]] && ! grep -Fq resumeBackups "$ROOT/calls" \
  || { print -u2 'Restart after failed resume lost the new session'; exit 1; }
 console_event 05:08:00 Done >> "$LOGS/console.log"
 wait_call resumeBackups

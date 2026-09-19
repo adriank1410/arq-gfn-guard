@@ -169,7 +169,8 @@ assert_resumed
 
 # Recovering a rotated start must retain its time through renewal/restart.
 rm "$GFN_DIR/console.log"
-debug_event 10 STARTED > "$GFN_DIR/debug.log"
+# This session starts after the preceding authenticated 23:00:20 end.
+debug_event 21 STARTED > "$GFN_DIR/debug.log"
 run_once 11200
 assert_owned
 mv -f "$GFN_DIR/debug.log" "$GFN_DIR/debug.log.bak"
@@ -179,7 +180,7 @@ assert_owned
 console_event 01 Done > "$GFN_DIR/console.log"
 run_once 11460
 assert_owned
-debug_event 20 TERMINATED > "$GFN_DIR/debug.log"
+debug_event 22 TERMINATED > "$GFN_DIR/debug.log"
 run_once 11470
 assert_resumed
 
@@ -215,7 +216,8 @@ SH
 chmod +x "$TEST_ROOT/mktemp"
 sed "s#/usr/bin/mktemp#$TEST_ROOT/mktemp#g" "$TEST_ROOT/guard" > "$TEST_ROOT/state-failure-guard"
 chmod +x "$TEST_ROOT/state-failure-guard"
-debug_event 30 STARTED >> "$GFN_DIR/debug.log"
+# This is a new session, not the identical pre-exit event from the v1 fixture.
+debug_event 31 STARTED >> "$GFN_DIR/debug.log"
 : > "$ALERTS"
 TEST_GUARD="$TEST_ROOT/state-failure-guard" run_once 11500
 assert_resumed
