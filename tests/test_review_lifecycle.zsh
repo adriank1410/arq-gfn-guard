@@ -5,7 +5,7 @@ readonly GUARD="${0:A:h:h}/arq-gfn-guard.sh"
 readonly ROOT="$(mktemp -d /tmp/arq-review.XXXXXX)"
 trap 'rm -rf "$ROOT"' EXIT
 event() { print -r -- "2026-09-12 $1 INFO gfn/StreamerManagerService  Advancing to state: $2" >> "$3"; }
-check() { "$@" || { print -u2 -- "FAIL: $*"; exit 1; }; }
+check() { "$@" || { print -u2 -- "FAIL (${funcfiletrace[1]}): $*"; exit 1; }; }
 setup() {
   export HOME="$ROOT/$1/home" ARQ_GFN_STATE_DIR="$ROOT/$1/state" \
     ARQ_GFN_GUARD_LOG="$ROOT/$1/guard.log" ARQ_GFN_ARQC="$ROOT/$1/arqc" \
@@ -20,10 +20,10 @@ setup() {
 step() { select_log_source; reconcile_backup_state "$1" "$selected_signature_out"; }
 restart() { ARQ_GFN_NOW="$1" ARQ_GFN_GUARD_ONCE=1 "$GUARD"; }
 failures=0
-for scenario in lease stopped rollback alerts action-alert replacement explicit resume unrelated-backup late-backup stopped-inactive candidate-error repeated-rename repeated-copy repeated-explicit repeated-backup-end repeated-stop end-save-failure missing-owned missing-unowned; do
+for scenario in lease stopped rollback alerts action-alert replacement explicit resume unrelated-backup late-backup stopped-inactive candidate-error repeated-rename repeated-copy repeated-explicit repeated-explicit-backup-end repeated-backup-end repeated-stop end-save-failure missing-owned missing-unowned; do
   (
     setup "$scenario"
-    [[ "$scenario" != repeated-explicit ]] || export ARQ_GFN_LOG_FILE="$HOME/Library/Application Support/NVIDIA/GeForceNOW/console.log"
+    [[ "$scenario" != repeated-explicit* ]] || export ARQ_GFN_LOG_FILE="$HOME/Library/Application Support/NVIDIA/GeForceNOW/console.log"
     if [[ "$scenario" == candidate-error ]]; then
       # Replace only the external tail reader to inject a real scan error.
       export ARQ_TEST_SCAN_FAIL="$ROOT/tail.fail"
@@ -44,10 +44,10 @@ for scenario in lease stopped rollback alerts action-alert replacement explicit 
         chmod 700 "$STATE_DIR"
         check test -f "$STATE_FILE"
         check test "$action_alert_kind" = state-save-failure
-        check test "$(grep -c '^resumeBackups$' "$ARQ_TEST_ACTIONS" || true)" = 0
+        check test "$(grep -c '^resumeBackups$' "$ARQ_TEST_ACTIONS" || true)" = 1
         step 1020
         check test ! -f "$STATE_FILE"
-        check test "$(grep -c '^resumeBackups$' "$ARQ_TEST_ACTIONS")" = 1
+        check test "$(grep -c '^resumeBackups$' "$ARQ_TEST_ACTIONS")" = 2
         ;;
       missing-owned|missing-unowned)
         if [[ "$scenario" == missing-owned ]]; then
@@ -67,7 +67,7 @@ for scenario in lease stopped rollback alerts action-alert replacement explicit 
           check test ! -f "$STATE_FILE"
         fi
         ;;
-      repeated-rename|repeated-copy|repeated-explicit|repeated-backup-end|repeated-stop)
+      repeated-rename|repeated-copy|repeated-explicit*|repeated-backup-end|repeated-stop)
         event 11:00:00.000 Streaming "$GFN_DEBUG_LOG"
         event 11:00:00.010 Streaming "$GFN_CONSOLE_LOG"; step 1000
         for rotation in 1 2 3; do
@@ -88,17 +88,22 @@ for scenario in lease stopped rollback alerts action-alert replacement explicit 
         done
         if [[ "$scenario" == repeated-stop ]]; then
           ARQ_GFN_FORCE_PROCESS=0
-        elif [[ "$scenario" == repeated-backup-end ]]; then
+        elif [[ "$scenario" == *backup-end ]]; then
           event 11:30:00.000 Done "$GFN_CONSOLE_LOG.bak"
         else
           event 11:30:00.000 Done "$GFN_CONSOLE_LOG"
         fi
-        step 1100
+        if [[ "$scenario" == *backup-end ]]; then
+          restart 1100
+        else
+          step 1100
+        fi
         check test ! -f "$STATE_FILE"
         # The launcher can stay open or reopen without starting a new game.
         ARQ_GFN_FORCE_PROCESS=1
         restart 1110
         check test ! -f "$STATE_FILE"
+        check test ! -f "$ALERT_DETECTION_STATE_FILE"
         check test "$(grep -c '^resumeBackups$' "$ARQ_TEST_ACTIONS")" = 1
         ;;
       late-backup)

@@ -52,7 +52,9 @@ write_owned_proof() {
   source_size="$(wc -c < "$source_file" | tr -d ' ')"
   {
     print -r -- 100
-    if [[ "$version" == source-v4 ]]; then
+    if [[ "$version" == source-v5 ]]; then
+      print -r -- "source-v5 $source_key $source_identity $source_size $event_time $source_key $revision - - $source_identity"
+    elif [[ "$version" == source-v4 ]]; then
       print -r -- "source-v4 $source_key $source_identity $source_size $event_time $source_key $revision - -"
     else
       print -r -- "source-v3 $source_key $source_identity $source_size $event_time $source_key"
@@ -65,10 +67,11 @@ write_owned_proof() {
 # A newer source-v4 lease proof must win over an older independent clock
 # snapshot. The old implementation restores the clock-v1 pin last and resumes
 # from the stale debug end instead of preserving the new console session.
+for proof_format in source-v4 source-v5; do
 clear_fixture
 debug_event 10 Done > "$LOG_DIR/debug.log"
 console_event 20 Streaming > "$LOG_DIR/console.log"
-write_owned_proof source-v4 console 1 "$LOG_DIR/console.log" 20260910000020000
+write_owned_proof "$proof_format" console 1 "$LOG_DIR/console.log" 20260910000020000
 print -r -- 'clock-v1 debug - -' > "$STATE_DIR/guard-clock"
 run_once 1000
 grep -Fq 'pauseBackups 10' "$CALLS" \
@@ -76,10 +79,11 @@ grep -Fq 'pauseBackups 10' "$CALLS" \
 if grep -Fq 'resumeBackups' "$CALLS"; then
   print -u2 'Older clock snapshot resumed the active session'; exit 1
 fi
+done
 
 # Conversely, a newer released clock snapshot must override an older pin
 # after a failed resume and allow the newer debug end to win.
-for proof_format in source-v3 source-v4; do
+for proof_format in source-v3 source-v4 source-v5; do
 clear_fixture
 debug_event 30 Done > "$LOG_DIR/debug.log"
 console_event 20 Streaming > "$LOG_DIR/console.log"

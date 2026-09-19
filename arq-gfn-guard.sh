@@ -737,6 +737,7 @@ latest_stream_state() {
   local source_key="${GFN_LOG_SOURCE_KEY:-explicit}"
   detected_stream_state_out=""
   local selected_candidate_state="" selected_candidate_time=""
+  local explicit_backup_signature="" explicit_backup_changed=0
   if [[ -z "$GFN_LOG_OVERRIDE" ]] && (( ! selected_source_evidence_valid )); then
     selected_source_untrusted=1
     return 0
@@ -746,7 +747,13 @@ latest_stream_state() {
           && "$debug_candidate_state|$debug_candidate_time" == "$stopped_debug_evidence" ]] \
         || [[ "$GFN_LOG_SOURCE_KEY" == console \
           && "$console_candidate_state|$console_candidate_time" == "$stopped_console_evidence" ]]; then
-      detected_stream_state_out=inactive
+      # Suppressed evidence ends only its own session. If the owned proof is
+      # already from a new start, losing that new source must retain the lease.
+      if [[ "$parsed_stream_state" != active ]] \
+          || [[ "$parsed_source_key" == debug && "active|$parsed_event_time" == "$stopped_debug_evidence" ]] \
+          || [[ "$parsed_source_key" == console && "active|$parsed_event_time" == "$stopped_console_evidence" ]]; then
+        detected_stream_state_out=inactive
+      fi
     fi
     return 0
   fi
@@ -763,8 +770,13 @@ latest_stream_state() {
       selected_candidate_state="$console_candidate_state"
       selected_candidate_time="$console_candidate_time"
     fi
+  elif [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" ]]; then
+    log_signature "$GFN_LOG_FILE.bak"
+    explicit_backup_signature="$log_signature_out"
+    [[ "$explicit_backup_signature" == "${candidate_backup_signature[$GFN_LOG_FILE]-}" ]] || explicit_backup_changed=1
   fi
   if [[ "$source_signature" == "$parsed_signature" ]] \
+      && (( !explicit_backup_changed )) \
       && [[ "$source_key" == "$parsed_source_key" ]] \
       && { [[ -n "$GFN_LOG_OVERRIDE" ]] \
         || [[ "$selected_candidate_state" == "$parsed_stream_state" \
@@ -829,12 +841,25 @@ latest_stream_state() {
     detected_event_time="${evidence#*$'\t'}"
   fi
 
-  if [[ -n "$GFN_LOG_OVERRIDE" && -z "$detected_state" ]] && (( same_parsed_source )); then
-    detected_state="$parsed_stream_state"
-    detected_event_time="$parsed_event_time"
+  if [[ -n "$GFN_LOG_OVERRIDE" ]]; then
+    if [[ -n "$detected_state" ]]; then
+      candidate_backup_identity[$GFN_LOG_FILE]=""
+      candidate_backup_signature[$GFN_LOG_FILE]=""
+    elif (( explicit_backup_changed )) && [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" ]]; then
+      trusted_rotated_evidence "$GFN_LOG_FILE" "${candidate_backup_identity[$GFN_LOG_FILE]}" 0 "" "" || return 0
+      if [[ -n "$trusted_evidence_out" ]]; then
+        detected_state="${trusted_evidence_out%%$'\t'*}"
+        detected_event_time="${trusted_evidence_out#*$'\t'}"
+      fi
+      candidate_backup_signature[$GFN_LOG_FILE]="$explicit_backup_signature"
+    fi
+    if [[ -z "$detected_state" ]] && (( same_parsed_source )); then
+      detected_state="$parsed_stream_state"
+      detected_event_time="$parsed_event_time"
+    fi
   fi
 
-  if [[ -n "$GFN_LOG_OVERRIDE" && "$detected_state" == active \
+  if [[ -n "$GFN_LOG_OVERRIDE" && ( "$detected_state" == active || -z "$detected_state" ) \
       && -n "$stopped_explicit_evidence" ]]; then
     local explicit_watermark
     explicit_watermark="$(explicit_event_watermark)" || return 0
@@ -881,6 +906,10 @@ latest_stream_state() {
     if [[ -n "$trusted_evidence_out" ]]; then
         detected_state="${trusted_evidence_out%%$'\t'*}"
         detected_event_time="${trusted_evidence_out#*$'\t'}"
+        if [[ -n "$GFN_LOG_OVERRIDE" ]]; then
+          candidate_backup_identity[$GFN_LOG_FILE]="$trusted_backup_identity_out"
+          candidate_backup_signature[$GFN_LOG_FILE]="$log_signature_out"
+        fi
         # The trusted old source proves this new file continues the lease.
         # Persist its identity too, so successive rotations remain recoverable.
     fi
@@ -1259,15 +1288,20 @@ read_state_timestamp() {
 restore_source_checkpoint() {
   [[ "$has_system" == true && -f "$STATE_FILE" ]] || return 1
   local proof_fd saved_epoch proof_version proof_source_key proof_identity proof_size proof_event_time proof_clock_key
-  local proof_clock_revision proof_debug_baseline proof_console_baseline extra
+  local proof_clock_revision proof_debug_baseline proof_console_baseline proof_backup_identity extra
   local prefix_data="" suffix_data="" chunk_size bytes_read legacy_proof=0
   local baseline_pattern='^(active|inactive)?[|]([0-9]{17})?$'
   { exec {proof_fd}< "$STATE_FILE"; } 2>/dev/null || return 1
   {
     IFS= read -r -u "$proof_fd" saved_epoch || return 1
     IFS=' ' read -r -u "$proof_fd" proof_version proof_source_key proof_identity proof_size proof_event_time \
-      proof_clock_key proof_clock_revision proof_debug_baseline proof_console_baseline extra || return 1
+      proof_clock_key proof_clock_revision proof_debug_baseline proof_console_baseline proof_backup_identity extra || return 1
     [[ "$saved_epoch" =~ ^[0-9]+$ && ${#saved_epoch} -le 18 ]] || return 1
+    if [[ "$proof_version" == source-v5 ]]; then
+      [[ "$proof_backup_identity" =~ ^[0-9]{1,18}:[0-9]{1,18}$ ]] || return 1
+    else
+      [[ -z "$proof_backup_identity" ]] || return 1
+    fi
     if [[ "$proof_version" == source-v1 ]]; then
       # Old state has no source path or event watermark. It remains usable for
       # its recorded identity, but an alternate source cannot prove an end.
@@ -1290,7 +1324,7 @@ restore_source_checkpoint() {
         [[ -z "$proof_clock_key" ]] || return 1
       fi
       legacy_proof=0
-    elif [[ "$proof_version" == source-v4 \
+    elif [[ ( "$proof_version" == source-v4 || "$proof_version" == source-v5 ) \
        && "$proof_source_key" =~ ^[A-Za-z0-9_.-]+$ \
        && "$proof_identity" =~ ^[0-9]{1,18}:[0-9]{1,18}$ \
        && "$proof_size" =~ ^[0-9]+$ && ${#proof_size} -le 18 \
@@ -1319,7 +1353,7 @@ restore_source_checkpoint() {
     if [[ "$proof_version" == source-v3 && "$proof_clock_key" != - ]]; then
       clock_source_key="$proof_clock_key"
     fi
-    if [[ "$proof_version" == source-v4 ]]; then
+    if [[ "$proof_version" == source-v4 || "$proof_version" == source-v5 ]]; then
       clock_source_key="${proof_clock_key/-/}"
       clock_debug_baseline="${proof_debug_baseline/-/}"
       clock_console_baseline="${proof_console_baseline/-/}"
@@ -1343,6 +1377,18 @@ restore_source_checkpoint() {
     parsed_prefix="$prefix_data"
     parsed_suffix="$suffix_data"
     source_proof_ready=1
+    local restored_source_file=""
+    case "$proof_source_key" in
+      debug) restored_source_file="$GFN_DEBUG_LOG" ;;
+      console) restored_source_file="$GFN_CONSOLE_LOG" ;;
+      explicit) restored_source_file="$GFN_LOG_OVERRIDE" ;;
+    esac
+    if [[ -n "$proof_backup_identity" && -n "$restored_source_file" ]]; then
+      candidate_backup_identity[$restored_source_file]="$proof_backup_identity"
+      # Force inspection of the authenticated writer on the first selector
+      # pass: it may have received the final event while we were stopped.
+      candidate_backup_signature[$restored_source_file]=""
+    fi
     # Seed only this source's candidate. Its inode and byte checkpoints are
     # revalidated by candidate_evidence before retaining the saved lifecycle.
     if [[ "$proof_source_key" == debug ]]; then
@@ -1366,6 +1412,13 @@ restore_source_checkpoint() {
 write_state_timestamp() {
   local epoch_value="$1"
   local temporary_state
+  local proof_source_file="" writer_identity=""
+  case "$parsed_source_key" in
+    debug) proof_source_file="$GFN_DEBUG_LOG" ;;
+    console) proof_source_file="$GFN_CONSOLE_LOG" ;;
+    explicit) proof_source_file="$GFN_LOG_OVERRIDE" ;;
+  esac
+  [[ -z "$proof_source_file" ]] || writer_identity="${candidate_backup_identity[$proof_source_file]-}"
   mkdir -p "$STATE_DIR" 2>/dev/null || {
     log_message "ERROR: could not recreate state directory"
     return 1
@@ -1380,7 +1433,10 @@ write_state_timestamp() {
       if (( source_proof_ready )) && [[ "$parsed_stream_state" == active \
           && -n "$parsed_source_key" \
           && ( "$parsed_event_time" == - || "$parsed_event_time" =~ ^[0-9]{17}$ ) ]]; then
-        if [[ -n "$clock_pending_payload$clock_saved_snapshot" || "$clock_revision" != 0 ]]; then
+        if [[ "$writer_identity" =~ ^[0-9]{1,18}:[0-9]{1,18}$ ]]; then
+          print -r -- "source-v5 $parsed_source_key $parsed_identity $parsed_size $parsed_event_time ${clock_source_key:--} $clock_revision ${clock_debug_baseline:--} ${clock_console_baseline:--} $writer_identity" \
+            && print -rn -- "$parsed_prefix$parsed_suffix"
+        elif [[ -n "$clock_pending_payload$clock_saved_snapshot" || "$clock_revision" != 0 ]]; then
           print -r -- "source-v4 $parsed_source_key $parsed_identity $parsed_size $parsed_event_time ${clock_source_key:--} $clock_revision ${clock_debug_baseline:--} ${clock_console_baseline:--}" \
             && print -rn -- "$parsed_prefix$parsed_suffix"
         else
@@ -1601,24 +1657,29 @@ reconcile_backup_state() {
       fi
     fi
   elif [[ -f "$STATE_FILE" ]]; then
-    if [[ "$detected_stream_state" == inactive && -z "$GFN_LOG_OVERRIDE" ]]; then
-      # The end may exist only in an authenticated .bak. Before removing its
-      # lease proof, persist which candidate events belong to the ended session
-      # so a restart cannot accept the other file's unchanged older start.
-      stopped_debug_evidence="$debug_candidate_state|$debug_candidate_time"
-      stopped_console_evidence="$console_candidate_state|$console_candidate_time"
-      if ! write_stopped_evidence; then
-        raise_alert "state-save-failure" "$now_epoch" \
-          "The GFN session ended, but its recovery state could not be saved; Arq resume will be retried." \
-          "Sesja GFN się zakończyła, ale nie zapisano jej stanu; wznowienie Arq zostanie ponowione." 1
-        return 0
-      fi
-    fi
     # Arq exposes one global pause and no supported CLI readback for the pause
     # that existed before this guard acted. The state file proves that this
     # guard successfully issued a pause, but overlapping independent manual
     # pauses are intentionally documented as unsupported.
     if run_arqc resumeBackups; then
+      if [[ "$detected_stream_state" == inactive ]] \
+          && { [[ -z "$GFN_LOG_OVERRIDE" ]] || [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" ]]; }; then
+        # The end may exist only in an authenticated .bak. After a successful resume and before removing its
+        # lease proof, persist which candidate events belong to the ended session
+        # so a restart cannot accept the other file's unchanged older start.
+        stopped_debug_evidence="$debug_candidate_state|$debug_candidate_time"
+        stopped_console_evidence="$console_candidate_state|$console_candidate_time"
+        local end_evidence_ready=1
+        if [[ -n "$GFN_LOG_OVERRIDE" ]]; then
+          stopped_explicit_evidence="$(explicit_event_watermark)" || end_evidence_ready=0
+        fi
+        if (( !end_evidence_ready )) || ! write_stopped_evidence; then
+          raise_alert "state-save-failure" "$now_epoch" \
+            "Arq resumed, but the ended session could not be saved; recovery will be retried." \
+            "Arq wznowił backup, ale nie zapisano zakończenia sesji; zapis zostanie ponowiony." 1
+          return 0
+        fi
+      fi
       rm -f "$STATE_FILE"
       clear_alert_episode
       log_message "GFN stream inactive; Arq resumed"

@@ -215,7 +215,8 @@ SH
 chmod +x "$TEST_ROOT/mktemp"
 sed "s#/usr/bin/mktemp#$TEST_ROOT/mktemp#g" "$TEST_ROOT/guard" > "$TEST_ROOT/state-failure-guard"
 chmod +x "$TEST_ROOT/state-failure-guard"
-debug_event 30 STARTED >> "$GFN_DIR/debug.log"
+# This is a new session, not the identical pre-exit event from the v1 fixture.
+debug_event 31 STARTED >> "$GFN_DIR/debug.log"
 : > "$ALERTS"
 TEST_GUARD="$TEST_ROOT/state-failure-guard" run_once 11500
 assert_resumed
