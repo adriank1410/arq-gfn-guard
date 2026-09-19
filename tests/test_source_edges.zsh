@@ -78,7 +78,9 @@ stop_guard
 
 # Backward local timestamps during an observed append must not lose to a
 # stale end in the other source, including while the owned guard restarts.
-rm -f "$ROOT/state/guard-paused"
+# Start an independent clock fixture, without the preceding 23:00 writer
+# proof: that proof correctly makes these rewritten 01:00 files stale.
+rm -f "$ROOT/state/guard-paused" "$ROOT/state/guard-stopped" "$LOGS/console.log.bak"
 : > "$ROOT/calls"
 debug_event 01:59:00 TERMINATED > "$LOGS/debug.log"
 console_event 01:58:00 Done > "$LOGS/console.log"
