@@ -554,6 +554,14 @@ restore_stopped_evidence() {
   fi
   stopped_debug_evidence="$saved_debug"
   stopped_console_evidence="$saved_console"
+  if [[ -f "$STATE_FILE" ]] && read_state_timestamp && (( state_epoch_out == 0 )); then
+    # Resume may have succeeded and saved the end before a crash/removal failure.
+    # Re-read inactive evidence to finish that pending resume, rather than hiding
+    # its end behind the active proof retained for recovery. Process-exit active
+    # fingerprints still suppress the stopped process's old starts.
+    [[ "$saved_debug" != inactive\|* ]] || stopped_debug_evidence=""
+    [[ "$saved_console" != inactive\|* ]] || stopped_console_evidence=""
+  fi
   # An active lease carries its own, newer writer proof. Ended-session metadata
   # must not attach an older writer to that new session.
   if [[ ! -f "$STATE_FILE" ]]; then
@@ -901,6 +909,10 @@ latest_stream_state() {
     elif (( explicit_backup_changed )) && [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" ]]; then
       explicit_evidence_file_out="$GFN_LOG_FILE.bak"
       trusted_rotated_evidence "$GFN_LOG_FILE" "${candidate_backup_identity[$GFN_LOG_FILE]}" 0 "" "" || return 0
+      if [[ -z "$trusted_backup_identity_out" ]]; then
+        selected_source_untrusted=1
+        return 0
+      fi
       if [[ -n "$trusted_evidence_out" ]]; then
         detected_state="${trusted_evidence_out%%$'\t'*}"
         detected_event_time="${trusted_evidence_out#*$'\t'}"
@@ -1772,7 +1784,12 @@ reconcile_backup_state() {
           return 0
         fi
       fi
-      rm -f "$STATE_FILE"
+      if ! rm -f "$STATE_FILE"; then
+        raise_alert "state-save-failure" "$now_epoch" \
+          "Arq resumed, but the guard could not clear its pause state; recovery will be retried." \
+          "Arq wznowił backup, ale guard nie usunął stanu pauzy; operacja zostanie ponowiona." 1
+        return 0
+      fi
       clear_alert_episode
       log_message "GFN stream inactive; Arq resumed"
       notify_user \

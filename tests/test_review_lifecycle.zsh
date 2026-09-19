@@ -21,10 +21,10 @@ setup() {
 step() { select_log_source; reconcile_backup_state "$1" "$selected_signature_out"; }
 restart() { ARQ_GFN_NOW="$1" ARQ_GFN_GUARD_ONCE=1 "${SCENARIO_GUARD:-$GUARD}"; }
 failures=0
-for scenario in lease stopped rollback alerts action-alert replacement explicit resume unrelated-backup late-backup stopped-inactive candidate-error repeated-rename repeated-copy repeated-explicit repeated-explicit-backup-end repeated-backup-end repeated-stop end-save-failure resume-metadata-failure explicit-resume-race explicit-stale-primary default-stale-primary explicit-stale-active default-stale-active missing-owned missing-unowned; do
+for scenario in lease stopped rollback alerts action-alert replacement explicit resume unrelated-backup late-backup stopped-inactive candidate-error repeated-rename repeated-copy repeated-explicit repeated-explicit-backup-end repeated-backup-end repeated-stop end-save-failure resume-metadata-failure explicit-resume-race explicit-stale-primary default-stale-primary explicit-stale-active default-stale-active resume-remove-failure explicit-missing-writer missing-owned missing-unowned; do
   (
     setup "$scenario"
-    [[ "$scenario" != repeated-explicit* && "$scenario" != explicit-resume-race && "$scenario" != explicit-stale-* ]] || export ARQ_GFN_LOG_FILE="$HOME/Library/Application Support/NVIDIA/GeForceNOW/console.log"
+    [[ "$scenario" != repeated-explicit* && "$scenario" != explicit-resume-race && "$scenario" != explicit-stale-* && "$scenario" != explicit-missing-writer ]] || export ARQ_GFN_LOG_FILE="$HOME/Library/Application Support/NVIDIA/GeForceNOW/console.log"
     if [[ "$scenario" == candidate-error ]]; then
       # Replace only the external tail reader to inject a real scan error.
       export ARQ_TEST_SCAN_FAIL="$ROOT/tail.fail"
@@ -48,6 +48,33 @@ for scenario in lease stopped rollback alerts action-alert replacement explicit 
       source <(awk '/^restore_source_checkpoint \|\| true$/ {exit} {print}' "$GUARD")
     fi
     case "$scenario" in
+      resume-remove-failure)
+        event 11:00:00.000 Streaming "$GFN_CONSOLE_LOG"; step 1000
+        event 11:01:00.000 Done "$GFN_CONSOLE_LOG"
+        # Fail only the external deletion after both resume and metadata save.
+        rm() { [[ "$*" != "-f $STATE_FILE" ]] || return 42; /bin/rm "$@"; }
+        step 1010
+        unfunction rm
+        check test -f "$STATE_FILE"
+        check test -f "$STOPPED_STATE_FILE"
+        check test "$action_alert_kind" = state-save-failure
+        restart 1020
+        check test ! -f "$STATE_FILE"
+        check test "$(grep -c '^pauseBackups' "$ARQ_TEST_ACTIONS")" = 1
+        ;;
+      explicit-missing-writer)
+        event 11:00:00.000 Streaming "$GFN_CONSOLE_LOG"; step 1000
+        mv "$GFN_CONSOLE_LOG" "$GFN_CONSOLE_LOG.bak"
+        print noise > "$GFN_CONSOLE_LOG"; step 1010
+        rm "$GFN_CONSOLE_LOG.bak"; step 1020
+        check test -n "$detection_alert_kind"
+        step 1250
+        check test -n "$detection_alert_kind"
+        check test -f "$STATE_FILE"
+        event 11:01:00.000 Done "$GFN_CONSOLE_LOG"; step 1260
+        check test ! -f "$STATE_FILE"
+        check test -z "$detection_alert_kind"
+        ;;
       explicit-stale-*|default-stale-*)
         event 11:00:00.000 Streaming "$GFN_CONSOLE_LOG"; step 1000
         mv "$GFN_CONSOLE_LOG" "$GFN_CONSOLE_LOG.bak"
