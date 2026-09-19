@@ -909,6 +909,12 @@ latest_stream_state() {
     elif (( explicit_backup_changed )) && [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" ]]; then
       explicit_evidence_file_out="$GFN_LOG_FILE.bak"
       trusted_rotated_evidence "$GFN_LOG_FILE" "${candidate_backup_identity[$GFN_LOG_FILE]}" 0 "" "" || return 0
+      if [[ -z "$trusted_backup_identity_out" ]] && (( replacement )); then
+        # Another rotation can replace .bak with the primary we last proved.
+        trusted_rotated_evidence "$GFN_LOG_FILE" || return 0
+        [[ -z "$trusted_backup_identity_out" ]] \
+          || candidate_backup_identity[$GFN_LOG_FILE]="$trusted_backup_identity_out"
+      fi
       if [[ -z "$trusted_backup_identity_out" ]]; then
         selected_source_untrusted=1
         return 0
