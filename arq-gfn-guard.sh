@@ -557,8 +557,16 @@ restore_stopped_evidence() {
   # An active lease carries its own, newer writer proof. Ended-session metadata
   # must not attach an older writer to that new session.
   if [[ ! -f "$STATE_FILE" ]]; then
-    [[ "$debug_writer" == - ]] || candidate_backup_identity[$GFN_DEBUG_LOG]="$debug_writer"
-    [[ "$console_writer" == - ]] || candidate_backup_identity[$GFN_CONSOLE_LOG]="$console_writer"
+    if [[ "$debug_writer" != - ]]; then
+      candidate_backup_identity[$GFN_DEBUG_LOG]="$debug_writer"
+      debug_candidate_state="${saved_debug%%|*}"
+      debug_candidate_time="${saved_debug#*|}"
+    fi
+    if [[ "$console_writer" != - ]]; then
+      candidate_backup_identity[$GFN_CONSOLE_LOG]="$console_writer"
+      console_candidate_state="${saved_console%%|*}"
+      console_candidate_time="${saved_console#*|}"
+    fi
   fi
   if [[ -n "$GFN_LOG_OVERRIDE" && "$saved_override" == "$GFN_LOG_OVERRIDE" ]]; then
     stopped_explicit_evidence="$saved_explicit"
@@ -871,12 +879,19 @@ latest_stream_state() {
   fi
 
   if [[ -n "$GFN_LOG_OVERRIDE" ]]; then
+    local explicit_reference_time="$parsed_event_time"
+    if [[ -z "$explicit_reference_time" && -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" ]]; then
+      # Ended explicit sessions store a CRC watermark, not a timestamp. Read
+      # the authenticated writer on restart before accepting the primary.
+      trusted_rotated_evidence "$GFN_LOG_FILE" "${candidate_backup_identity[$GFN_LOG_FILE]}" 0 "" "" || return 0
+      explicit_reference_time="${trusted_evidence_out#*$'\t'}"
+    fi
     # A replacement's stale marker must not detach the authenticated writer.
     # It can still receive the current session's end after the rename.
     if [[ -n "${candidate_backup_identity[$GFN_LOG_FILE]-}" \
         && "$detected_event_time" =~ ^[0-9]{17}$ \
-        && "$parsed_event_time" =~ ^[0-9]{17}$ \
-        && "$detected_event_time" < "$parsed_event_time" ]]; then
+        && "$explicit_reference_time" =~ ^[0-9]{17}$ \
+        && "$detected_event_time" < "$explicit_reference_time" ]]; then
       detected_state=""
       detected_event_time=""
       explicit_backup_changed=1
